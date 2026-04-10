@@ -171,36 +171,62 @@ final class AudioEngine {
     
     @available(macOS 14.2, *)
     private func createTap() -> Bool {
-        // Create global stereo tap using sudara's approach
-        // Empty array = tap all processes (exclusive=true means array is exclusion list)
-        let tapDesc = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
+        // Try device-specific tap instead of global tap for better mute behavior
+        // Get default output device UID
+        guard let defaultDeviceID = getDefaultOutputDevice() else {
+            Logger.error("Failed to get default output device for tap")
+            return false
+        }
         
-        // The convenience init already sets:
-        // - exclusive = true (processes array is exclusion list)
-        // - mixdown to stereo
-        // But we need to set mute and private
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceUID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size = UInt32(MemoryLayout<CFString>.size)
+        var deviceUIDCF: CFString = "" as CFString
         
-        // Note: CATapDescription properties are read-only after creation,
-        // so we set them via the property setters which work differently
-        // Actually, looking at Apple sample - these ARE properties:
-        // var description = CATapDescription(); description.name = "..."
+        let uidStatus = withUnsafeMutablePointer(to: &deviceUIDCF) { ptr in
+            AudioObjectGetPropertyData(defaultDeviceID, &address, 0, nil, &size, ptr)
+        }
         
-        // The stereoGlobalTapButExcludeProcesses creates a preconfigured tap,
-        // but we can modify it. Let's use properties:
+        guard uidStatus == noErr else {
+            Logger.error("Failed to get device UID", metadata: ["status": "\(uidStatus)"])
+            return false
+        }
+        
+        // Exclude MacPEQ's own process from the tap. Without this, MacPEQ's
+        // AUHAL output gets re-captured by the tap on the next IOProc cycle,
+        // creating a ~100ms delay feedback loop that sounds like a frozen
+        // granular synth slowly moving through the audio.
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        let ownProcessObject = translatePIDToProcessObject(ownPID)
+        let excludedProcesses: [NSNumber] = ownProcessObject.map { [NSNumber(value: $0)] } ?? []
+
+        let tapDesc = CATapDescription(
+            __processes: excludedProcesses,
+            andDeviceUID: deviceUIDCF as String,
+            withStream: 0
+        )
+
         tapDesc.isPrivate = true
         tapDesc.name = "MacPEQ"
-        // For mute behavior, we need to set it via property
-        // description.muteBehavior is a CATapMuteBehavior enum
-        // .muted silences the tap itself on macOS 15
-        // .mutedWhenTapped mutes original when tap is active - may silence Firefox
-        // .unmuted = both play (for testing passthrough)
-        tapDesc.muteBehavior = .unmuted
-        
-        Logger.info("Creating global stereo tap", metadata: [
-            "mute": "unmuted",
+        tapDesc.isExclusive = true  // processes list is an exclusion list
+
+        // With MacPEQ excluded, .muted safely silences the original audio on
+        // the device so only our processed AUHAL output reaches speakers.
+        // Fall back to .unmuted if we couldn't resolve our own process object
+        // (otherwise .muted would silence MacPEQ itself along with everything else).
+        let canMute = ownProcessObject != nil
+        tapDesc.muteBehavior = canMute ? .muted : .unmuted
+
+        Logger.info("Creating device-specific tap", metadata: [
+            "deviceUID": deviceUIDCF as String,
+            "excludedPID": "\(ownPID)",
+            "excludedProcessObject": ownProcessObject.map { "\($0)" } ?? "nil",
+            "mute": canMute ? "muted" : "unmuted",
             "private": "\(tapDesc.isPrivate)",
-            "exclusive": "\(tapDesc.isExclusive)",
-            "processes": "all (empty exclusion list)"
+            "exclusive": "\(tapDesc.isExclusive)"
         ])
         
         let status = AudioHardwareCreateProcessTap(tapDesc, &tapID)
@@ -210,15 +236,15 @@ final class AudioEngine {
         }
         
         // Log tap format
-        var address = AudioObjectPropertyAddress(
+        var formatAddr = AudioObjectPropertyAddress(
             mSelector: kAudioTapPropertyFormat,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
         var format = AudioStreamBasicDescription()
-        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        var formatSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
         
-        let fmtStatus = AudioObjectGetPropertyData(tapID, &address, 0, nil, &size, &format)
+        let fmtStatus = AudioObjectGetPropertyData(tapID, &formatAddr, 0, nil, &formatSize, &format)
         if fmtStatus == noErr {
             Logger.info("Tap format", metadata: [
                 "rate": "\(Int(format.mSampleRate))",
@@ -387,6 +413,8 @@ final class AudioEngine {
     private var sinePhase: Float = 0
     private let sineFreq: Float = 1000.0
     
+    private var firstIOProc = true
+    
     func handleIOProc(
         inputData: UnsafePointer<AudioBufferList>,
         outputData: UnsafeMutablePointer<AudioBufferList>
@@ -396,6 +424,17 @@ final class AudioEngine {
         
         let buffer = bufferList.mBuffers
         guard buffer.mData != nil, buffer.mDataByteSize > 0 else { return noErr }
+        
+        // Log format details once
+        if firstIOProc {
+            firstIOProc = false
+            Logger.info("IOProc format details", metadata: [
+                "mNumberBuffers": "\(bufferList.mNumberBuffers)",
+                "mNumberChannels": "\(buffer.mNumberChannels)",
+                "mDataByteSize": "\(buffer.mDataByteSize)",
+                "expectedFrames": "\(Int(buffer.mDataByteSize) / (2 * MemoryLayout<Float>.size))"
+            ])
+        }
         
         let bytesPerSample = MemoryLayout<Float>.size
         let sampleCount = Int(buffer.mDataByteSize) / bytesPerSample
@@ -433,11 +472,22 @@ final class AudioEngine {
             
             var peak: Float = 0
             var dcOffset: Float = 0
+            var sampleSum: Float = 0
             for i in 0..<min(sampleCount, 1024) {
                 peak = max(peak, abs(samples[i]))
                 dcOffset += samples[i]
+                sampleSum += samples[i]
             }
             dcOffset /= Float(min(sampleCount, 1024))
+            
+            // Detect stuck IOProc - same sum means same data
+            let sumDiff = abs(sampleSum - lastIOSum)
+            lastIOSum = sampleSum
+            if sumDiff < 0.0001 && peak > 0.001 {
+                stuckIOCount += 1
+            } else {
+                stuckIOCount = 0
+            }
             
             // Write to ring buffer (using frame count)
             let written = ringBuffer?.write(samples, frameCount: frameCount) ?? 0
@@ -461,10 +511,14 @@ final class AudioEngine {
                     "written": "\(written)",
                     "peak": String(format: "%.4f", peak),
                     "s0-1": String(format: "%.4f,%.4f", s0, s1),
-                    "ringFill": String(format: "%.2f", ringBuffer?.fillRatio() ?? 0)
+                    "ringFill": String(format: "%.2f", ringBuffer?.fillRatio() ?? 0),
+                    "stuckIO": "\(stuckIOCount)"
                 ]
                 if ioProcCallbackCount == 10 && isSilent {
                     meta["WARNING"] = "TAP_SILENT"
+                }
+                if stuckIOCount > 5 {
+                    meta["STUCK_IO"] = "YES"
                 }
                 Logger.debug("IOProc callback", metadata: meta)
             }
@@ -513,6 +567,23 @@ final class AudioEngine {
         guard devStatus == noErr else {
             Logger.error("AudioUnitSetProperty(CurrentDevice) failed", metadata: ["status": "\(devStatus)"])
             return false
+        }
+        
+        // Get output device sample rate to compare with tap
+        var outputRateAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var outputRate: Float64 = 0
+        var rateSize = UInt32(MemoryLayout<Float64>.size)
+        let rateStatus = AudioObjectGetPropertyData(deviceID, &outputRateAddr, 0, nil, &rateSize, &outputRate)
+        if rateStatus == noErr {
+            Logger.info("Output device sample rate", metadata: [
+                "outputRate": "\(Int(outputRate))",
+                "tapRate": "\(Int(tapFormat.mSampleRate))",
+                "match": "\(Int(outputRate) == Int(tapFormat.mSampleRate))"
+            ])
         }
         
         // Enable output, disable input
@@ -578,8 +649,18 @@ final class AudioEngine {
     
     private var renderCallbackCount: Int = 0
     private var lastRenderPeak: Float = -1
+    private var lastRenderHash: UInt64 = 0
+    private var frozenCounter: Int = 0
     
     private var lastWrittenSample: Float = 0
+    
+    // Detailed diagnostics for frozen audio investigation
+    private var ioProcSampleSum: Float = 0
+    private var auHalSampleSum: Float = 0
+    private var lastIOSum: Float = -1
+    private var lastAUHSum: Float = -1
+    private var stuckIOCount: Int = 0
+    private var stuckAUHCount: Int = 0
     
     private func handleAUHALRender(frames: UInt32, buffers: UnsafeMutablePointer<AudioBufferList>) -> OSStatus {
         let bufferList = buffers.pointee
@@ -603,13 +684,24 @@ final class AudioEngine {
             totalReadFrames += readFrames
             let readSamples = readFrames * channelCount
             
-            // Calculate peak for logging
+            // Calculate peak and sum for logging
             let readCount = readFrames * channelCount
             var localPeak: Float = 0
+            var sampleSum: Float = 0
             for j in 0..<readCount {
                 let sample = dest[j]
                 localPeak = max(localPeak, abs(sample))
                 totalPeak = max(totalPeak, abs(sample))
+                sampleSum += sample
+            }
+            
+            // Track if AUHAL is getting stuck (same sum repeatedly)
+            let sumDiff = abs(sampleSum - lastAUHSum)
+            if sumDiff < 0.0001 && totalPeak > 0.001 {
+                stuckAUHCount += 1
+            } else {
+                stuckAUHCount = 0
+                lastAUHSum = sampleSum
             }
             
             if readFrames < requestedFrames {
@@ -633,7 +725,7 @@ final class AudioEngine {
         let isFrozen = abs(totalPeak - lastRenderPeak) < 0.0001 && totalPeak > 0.01
         lastRenderPeak = totalPeak
         
-        if renderCallbackCount <= 10 || renderCallbackCount % 100 == 0 || underflow || totalPeak > 1.0 || isFrozen {
+        if renderCallbackCount <= 10 || renderCallbackCount % 100 == 0 || underflow || totalPeak > 1.0 || stuckAUHCount > 5 {
             var meta: [String: String] = [
                 "callback": "\(renderCallbackCount)",
                 "frames": "\(frames)",
@@ -641,10 +733,11 @@ final class AudioEngine {
                 "peak": String(format: "%.4f", totalPeak),
                 "ringFill": String(format: "%.2f", fillRatio),
                 "underflow": "\(underflow)",
-                "haveData": "\(totalReadFrames > 0)"
+                "haveData": "\(totalReadFrames > 0)",
+                "stuckAUH": "\(stuckAUHCount)"
             ]
-            if isFrozen {
-                meta["FROZEN"] = "YES"
+            if stuckAUHCount > 5 {
+                meta["STUCK_AUH"] = "YES"
             }
             Logger.debug("AUHAL render", metadata: meta)
         }

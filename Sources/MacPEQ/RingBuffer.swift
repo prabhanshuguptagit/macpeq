@@ -101,6 +101,27 @@ final class RingBuffer {
         return Float(available) / Float(capacityFrames)
     }
     
+    /// Manual drift compensation: drop one frame if buffer is too full (>70%)
+    /// Returns true if a frame was dropped
+    @discardableResult
+    func compensateDriftIfNeeded() -> Bool {
+        let ratio = fillRatio()
+        
+        // If buffer is getting too full, drop a frame (writer is faster than reader)
+        if ratio > 0.7 {
+            var availableBytes: UInt32 = 0
+            if let tail = TPCircularBufferTail(&circularBuffer, &availableBytes) {
+                if availableBytes >= UInt32(bytesPerFrame) {
+                    TPCircularBufferConsume(&circularBuffer, UInt32(bytesPerFrame))
+                    Logger.debug("Drift compensation: dropped 1 frame", metadata: ["fillRatio": "\(ratio)"])
+                    return true
+                }
+            }
+        }
+        
+        return false
+    }
+    
     /// Clear the buffer - use when switching devices
     func clear() {
         // Consume all available data
