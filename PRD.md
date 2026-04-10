@@ -811,3 +811,29 @@ These are real, working implementations of Core Audio taps that the agent should
 | **Apple docs** | https://developer.apple.com/documentation/coreaudio/capturing-system-audio-with-core-audio-taps | Official documentation. Contains the `kAudioAggregateDevicePropertyTapList` bug (uses tapID instead of aggregateDeviceID). Read the CoreAudio C headers directly for better documentation than the web docs. |
 
 **Note on the Apple documentation bug:** Apple's own sample code for modifying `kAudioAggregateDevicePropertyTapList` incorrectly uses `tapID` as the target `AudioObjectID` in both `AudioObjectGetPropertyData` and `AudioObjectSetPropertyData`. The correct target is `aggregateDeviceID`. This has been filed as Feedback FB17411663. All third-party implementations work around this.
+
+
+Here's a section you can drop into Section 6 (Critical Implementation Details):
+
+---
+
+### Internal Audio Format Convention
+
+The entire internal pipeline uses a single canonical format:
+
+**Float32, non-interleaved, stereo (2 channels), at the tap's native sample rate.**
+
+This applies to: the ring buffer contents, all EQ processing, and the data passed between components. Format conversions happen only at the two boundaries of the pipeline:
+
+**Entry (tap IOProc):** If `kAudioTapPropertyFormat` reports anything other than Float32 non-interleaved (possible with some Bluetooth devices), convert via `AudioConverterNew` before writing to the ring buffer. After conversion, the ring buffer always contains the canonical format.
+
+**Exit (AUHAL render callback):** Set the AUHAL input scope (element 0, `kAudioUnitScope_Input`) to Float32, non-interleaved, stereo, at the appropriate rate:
+- If tap rate matches the output device rate → set to tap rate. No converter needed.
+- If tap rate differs → the AudioConverter (see "Sample Rate Conversion" section) resamples from the ring buffer's tap rate to the device rate. Set the AUHAL input scope to the device's native rate.
+
+**Do not set the AUHAL output scope format** (element 0, `kAudioUnitScope_Output`). The AUHAL reads this from the hardware device automatically and handles final conversion (e.g., to Int24, interleaved) internally. Overriding it causes format mismatches that produce noise or silence.
+
+```
+Tap IOProc          →  [convert if needed]  →  Ring Buffer  →  EQ  →  [resample if needed]  →  AUHAL input scope  →  [AUHAL internal]  →  Hardware
+Float32/NI/2ch/tapRate                         canonical        canonical                       Float32/NI/2ch/devRate                      device-native
+```
