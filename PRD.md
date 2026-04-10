@@ -215,34 +215,7 @@ Each checkpoint has a **binary pass/fail gate**. Do not advance to the next chec
 
 ---
 
-### Checkpoint 2: Device Switching
-
-**Goal:** App survives output device changes (speakers → AirPods → headphones → USB DAC → back) without crashing or going silent.
-
-**Success gate:** Switch devices while audio is playing. Audio resumes on the new device within ~300ms. No crash, no stuck silence.
-
-**Implementation steps:**
-
-1. Register a property listener on `kAudioObjectSystemObject` for `kAudioHardwarePropertyDefaultOutputDevice`.
-2. In the listener callback (fires on an arbitrary Core Audio thread — **dispatch to your own serial queue**, never main):
-   - Stop the AUHAL output unit → release it.
-   - Stop the aggregate device IOProc → destroy the aggregate device.
-   - Destroy the tap.
-   - **Clear the ring buffer** (stale samples from the old device's sample rate will cause noise).
-   - Re-read the new default output device ID.
-   - Rebuild everything in order: tap → aggregate device → ring buffer → AUHAL.
-   - Log the new tap format. **If sample rates differ between tap and output device, set up an AudioConverter** (same as CP1 step 10).
-3. Test with: built-in speakers → Bluetooth headphones → AirPods → USB DAC → back to speakers.
-
-**Known gotchas:**
-- AirPods may negotiate different sample rates depending on mode (24kHz SCO vs 48kHz A2DP). Your rebuild must handle this — read the new tap format, set up AudioConverter if rates differ.
-- The serial queue for rebuilds prevents races if the user switches devices rapidly.
-- Don't rebuild on main thread — the Core Audio calls can block.
-- If aggregate device creation fails with `1852797029` during rebuild, the previous destroy didn't complete cleanly. Handle the same way as CP1 step 7 — destroy stale, retry.
-
----
-
-### Checkpoint 3: Single Biquad Filter (Validate DSP Path)
+### Checkpoint 2: Single Biquad Filter (Validate DSP Path)
 
 **Goal:** Insert a single hardcoded filter between the ring buffer and AUHAL output. Prove DSP works in the real-time path.
 
@@ -277,6 +250,34 @@ Each checkpoint has a **binary pass/fail gate**. Do not advance to the next chec
 - Render callback is a real-time thread. The `BiquadFilter.process()` method must be pure arithmetic — no allocations, no locks, no Swift runtime overhead.
 - Log `kAudioTapPropertyFormat` — processing must be in the same format. If the tap delivers Float32 non-interleaved, process Float32 non-interleaved. Mismatch → noise or silence.
 - Filter state must NOT be reset between callbacks. The `x1, x2, y1, y2` values carry signal continuity.
+
+---
+
+
+### Checkpoint 3: Device Switching
+
+**Goal:** App survives output device changes (speakers → AirPods → headphones → USB DAC → back) without crashing or going silent.
+
+**Success gate:** Switch devices while audio is playing. Audio resumes on the new device within ~300ms. No crash, no stuck silence.
+
+**Implementation steps:**
+
+1. Register a property listener on `kAudioObjectSystemObject` for `kAudioHardwarePropertyDefaultOutputDevice`.
+2. In the listener callback (fires on an arbitrary Core Audio thread — **dispatch to your own serial queue**, never main):
+   - Stop the AUHAL output unit → release it.
+   - Stop the aggregate device IOProc → destroy the aggregate device.
+   - Destroy the tap.
+   - **Clear the ring buffer** (stale samples from the old device's sample rate will cause noise).
+   - Re-read the new default output device ID.
+   - Rebuild everything in order: tap → aggregate device → ring buffer → AUHAL.
+   - Log the new tap format. **If sample rates differ between tap and output device, set up an AudioConverter** (same as CP1 step 10).
+3. Test with: built-in speakers → Bluetooth headphones → AirPods → USB DAC → back to speakers.
+
+**Known gotchas:**
+- AirPods may negotiate different sample rates depending on mode (24kHz SCO vs 48kHz A2DP). Your rebuild must handle this — read the new tap format, set up AudioConverter if rates differ.
+- The serial queue for rebuilds prevents races if the user switches devices rapidly.
+- Don't rebuild on main thread — the Core Audio calls can block.
+- If aggregate device creation fails with `1852797029` during rebuild, the previous destroy didn't complete cleanly. Handle the same way as CP1 step 7 — destroy stale, retry.
 
 ---
 
