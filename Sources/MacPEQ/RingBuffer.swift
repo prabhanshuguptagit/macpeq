@@ -1,74 +1,113 @@
 import Foundation
+import CTPCircularBuffer
 
-/// Simple lock-free SPSC ring buffer for audio data
+/// Lock-free SPSC ring buffer using TPCircularBuffer
 /// Thread-safe: single producer (IOProc), single consumer (AUHAL render callback)
 final class RingBuffer {
-    private let buffer: UnsafeMutablePointer<Float>
-    private let capacity: Int
-    private let capacityMask: Int
+    private var circularBuffer: TPCircularBuffer
+    private let bytesPerFrame: Int
+    let capacityFrames: Int32
+    let channels: Int
     
-    // Use atomics for head/tail to avoid locks
-    private var head: Int = 0  // Write position (IOProc)
-    private var tail: Int = 0  // Read position (AUHAL)
-    
-    init(capacityFrames: Int, channels: Int) {
-        // Round up to power of 2 for efficient masking
-        var cap = 1
-        while cap < capacityFrames * channels {
-            cap <<= 1
+    /// Initialize with capacity in frames (will be rounded up to next power of 2)
+    init(capacityFrames: Int32, channels: Int, bytesPerSample: Int = MemoryLayout<Float>.size) {
+        self.capacityFrames = capacityFrames
+        self.channels = channels
+        self.bytesPerFrame = channels * bytesPerSample
+        
+        // TPCircularBuffer will round up to next power of 2 internally
+        self.circularBuffer = TPCircularBuffer()
+        let capacityBytes = UInt32(Int(capacityFrames) * bytesPerFrame)
+        // Use the actual function instead of macro
+        let success = _TPCircularBufferInit(&circularBuffer, capacityBytes, MemoryLayout<TPCircularBuffer>.size)
+        
+        // Pre-zero the buffer memory
+        var availableBytes: UInt32 = 0
+        if let head = TPCircularBufferHead(&circularBuffer, &availableBytes) {
+            memset(head, 0, Int(capacityBytes))
+            TPCircularBufferProduce(&circularBuffer, capacityBytes)
+            TPCircularBufferConsume(&circularBuffer, capacityBytes)
         }
-        self.capacity = cap
-        self.capacityMask = cap - 1
-        self.buffer = UnsafeMutablePointer<Float>.allocate(capacity: cap)
-        self.buffer.initialize(repeating: 0, count: cap)
+        
+        Logger.info("RingBuffer initialized", metadata: [
+            "capacityFrames": "\(capacityFrames)",
+            "capacityBytes": "\(capacityBytes)",
+            "channels": "\(channels)",
+            "success": "\(success)"
+        ])
     }
     
     deinit {
-        buffer.deallocate()
+        TPCircularBufferCleanup(&circularBuffer)
     }
     
-    /// Write audio samples. Called from IOProc (audio thread).
-    /// Returns number of samples actually written.
+    /// Write audio samples. Called from IOProc (producer thread).
+    /// Returns number of frames actually written.
     @discardableResult
-    func write(_ samples: UnsafePointer<Float>, count: Int) -> Int {
-        let available = capacity - availableBytes()
-        let toWrite = min(count, available)
+    func write(_ samples: UnsafePointer<Float>, frameCount: Int) -> Int {
+        let bytesToWrite = UInt32(frameCount * bytesPerFrame)
+        var availableBytes: UInt32 = 0
         
-        for i in 0..<toWrite {
-            buffer[(head + i) & capacityMask] = samples[i]
+        guard let head = TPCircularBufferHead(&circularBuffer, &availableBytes) else {
+            return 0
         }
-        head = (head + toWrite) & capacityMask
-        return toWrite
+        
+        let writeBytes = min(bytesToWrite, availableBytes)
+        if writeBytes > 0 {
+            memcpy(head, samples, Int(writeBytes))
+            TPCircularBufferProduce(&circularBuffer, writeBytes)
+        }
+        
+        return Int(writeBytes) / bytesPerFrame
     }
     
-    /// Read audio samples. Called from AUHAL render callback (audio thread).
-    /// Returns number of samples actually read.
+    /// Read audio samples. Called from AUHAL render callback (consumer thread).
+    /// Returns number of frames actually read.
     @discardableResult
-    func read(into dest: UnsafeMutablePointer<Float>, count: Int) -> Int {
-        let available = availableBytes()
-        let toRead = min(count, available)
+    func read(into dest: UnsafeMutablePointer<Float>, frameCount: Int) -> Int {
+        let bytesToRead = UInt32(frameCount * bytesPerFrame)
+        var availableBytes: UInt32 = 0
         
-        for i in 0..<toRead {
-            dest[i] = buffer[(tail + i) & capacityMask]
+        guard let tail = TPCircularBufferTail(&circularBuffer, &availableBytes) else {
+            return 0
         }
-        tail = (tail + toRead) & capacityMask
-        return toRead
+        
+        let readBytes = min(bytesToRead, availableBytes)
+        if readBytes > 0 {
+            memcpy(dest, tail, Int(readBytes))
+            TPCircularBufferConsume(&circularBuffer, readBytes)
+        }
+        
+        return Int(readBytes) / bytesPerFrame
     }
     
-    /// Zero the buffer when switching devices
-    func clear() {
-        head = 0
-        tail = 0
-        buffer.initialize(repeating: 0, count: capacity)
+    /// Get available frames to read (consumer side)
+    func availableFrames() -> Int {
+        var availableBytes: UInt32 = 0
+        _ = TPCircularBufferTail(&circularBuffer, &availableBytes)
+        return Int(availableBytes) / bytesPerFrame
     }
     
-    /// Get available samples to read
-    func availableBytes() -> Int {
-        return (head - tail) & capacityMask
+    /// Get available space to write (producer side)
+    func availableSpace() -> Int {
+        var availableBytes: UInt32 = 0
+        _ = TPCircularBufferHead(&circularBuffer, &availableBytes)
+        return Int(availableBytes) / bytesPerFrame
     }
     
     /// Get fill ratio (0.0 to 1.0)
     func fillRatio() -> Float {
-        return Float(availableBytes()) / Float(capacity)
+        let available = availableFrames()
+        return Float(available) / Float(capacityFrames)
+    }
+    
+    /// Clear the buffer - use when switching devices
+    func clear() {
+        // Consume all available data
+        var availableBytes: UInt32 = 0
+        while let _ = TPCircularBufferTail(&circularBuffer, &availableBytes) {
+            if availableBytes == 0 { break }
+            TPCircularBufferConsume(&circularBuffer, availableBytes)
+        }
     }
 }

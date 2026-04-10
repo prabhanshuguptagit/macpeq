@@ -39,9 +39,8 @@ final class AudioEngine {
     
     private var ringBuffer: RingBuffer?
     private var isRunning = false
-    private let sampleRate: Double = 48000  // Will read from tap format
-    private let channels: UInt32 = 2
-    private let ringBufferFrames: Int = 16384  // ~340ms at 48kHz
+    private var tapFormat = AudioStreamBasicDescription()  // Actual tap format
+    private let ringBufferFrames: Int32 = 16384  // ~340ms at 48kHz
     
     // MARK: - Lifecycle
     
@@ -68,9 +67,17 @@ final class AudioEngine {
             return false
         }
         
-        // 4. Create ring buffer
-        ringBuffer = RingBuffer(capacityFrames: ringBufferFrames, channels: Int(channels))
-        Logger.info("Created ring buffer", metadata: ["frames": "\(ringBufferFrames)"])
+        // 4. Create ring buffer (using actual tap format)
+        ringBuffer = RingBuffer(
+            capacityFrames: ringBufferFrames,
+            channels: Int(tapFormat.mChannelsPerFrame),
+            bytesPerSample: Int(tapFormat.mBytesPerFrame / tapFormat.mChannelsPerFrame)
+        )
+        Logger.info("Created ring buffer", metadata: [
+            "frames": "\(ringBufferFrames)",
+            "channels": "\(tapFormat.mChannelsPerFrame)",
+            "sampleRate": "\(Int(tapFormat.mSampleRate))"
+        ])
         
         // 5. Setup IOProc on aggregate device
         guard setupIOProc() else {
@@ -222,6 +229,9 @@ final class AudioEngine {
             ])
         }
         
+        // Store the tap format for later use
+        self.tapFormat = format
+        
         Logger.info("Tap created", metadata: ["id": "\(tapID)"])
         return true
     }
@@ -245,56 +255,84 @@ final class AudioEngine {
             return false
         }
         
+        // CRITICAL: Use the proper tap list format as per sudara's gist and PRD
+        // The tap list is an array of dictionaries with drift compensation
+        // kAudioSubTapDriftCompensationKey: true handles clock drift at HAL level
+        let uid = UUID().uuidString
         let tapUIDString = tapUIDCF as String
         
-        // Create empty aggregate device first (audiotee approach)
-        let uid = UUID().uuidString
+        let tapList: [[String: Any]] = [
+            [
+                kAudioSubTapUIDKey: tapUIDString,
+                kAudioSubTapDriftCompensationKey: true
+            ]
+        ]
+        
         let aggregateDict: [String: Any] = [
             kAudioAggregateDeviceNameKey: "MacPEQ",
             kAudioAggregateDeviceUIDKey: "com.macpeq.aggregate.\(uid)",
-            kAudioAggregateDeviceSubDeviceListKey: [] as CFArray,
-            kAudioAggregateDeviceMasterSubDeviceKey: 0,
-            kAudioAggregateDeviceIsPrivateKey: true,
-            kAudioAggregateDeviceIsStackedKey: false
+            kAudioAggregateDeviceTapListKey: tapList,
+            kAudioAggregateDeviceTapAutoStartKey: false,
+            kAudioAggregateDeviceIsPrivateKey: true
         ]
         
-        Logger.info("Creating aggregate device", metadata: ["uid": uid])
+        Logger.info("Creating aggregate device with drift compensation", metadata: [
+            "uid": uid,
+            "tapUID": tapUIDString,
+            "driftCompensation": "true"
+        ])
         
         let status = AudioHardwareCreateAggregateDevice(aggregateDict as CFDictionary, &aggregateDeviceID)
         
-        guard status == noErr else {
+        // Handle stale aggregate device (error 1852797029)
+        if status == 1852797029 {
+            Logger.warning("Aggregate device already exists, attempting cleanup and retry")
+            
+            // Try to find and destroy the stale device
+            var lookupAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyTranslateUIDToDevice,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            var staleDeviceID: AudioDeviceID = 0
+            var deviceSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+            var testUID = "com.macpeq.aggregate.\(uid)" as CFString
+            
+            let lookupStatus = AudioObjectGetPropertyData(
+                AudioObjectID(kAudioObjectSystemObject),
+                &lookupAddr,
+                UInt32(MemoryLayout<CFString>.size),
+                &testUID,
+                &deviceSize,
+                &staleDeviceID
+            )
+            
+            if lookupStatus == noErr && staleDeviceID != 0 {
+                AudioHardwareDestroyAggregateDevice(staleDeviceID)
+                Logger.info("Destroyed stale aggregate device", metadata: ["id": "\(staleDeviceID)"])
+            }
+            
+            // Retry with a new unique UID
+            let newUID = UUID().uuidString
+            let retryDict: [String: Any] = [
+                kAudioAggregateDeviceNameKey: "MacPEQ",
+                kAudioAggregateDeviceUIDKey: "com.macpeq.aggregate.\(newUID)",
+                kAudioAggregateDeviceTapListKey: tapList,
+                kAudioAggregateDeviceTapAutoStartKey: false,
+                kAudioAggregateDeviceIsPrivateKey: true
+            ]
+            
+            let retryStatus = AudioHardwareCreateAggregateDevice(retryDict as CFDictionary, &aggregateDeviceID)
+            guard retryStatus == noErr else {
+                Logger.error("AudioHardwareCreateAggregateDevice retry failed", metadata: ["status": "\(retryStatus)"])
+                return false
+            }
+        } else if status != noErr {
             Logger.error("AudioHardwareCreateAggregateDevice failed", metadata: ["status": "\(status)"])
             return false
         }
         
         Logger.info("Aggregate device created", metadata: ["id": "\(aggregateDeviceID)"])
-        
-        // Now add the tap to the aggregate device via property (audiotee approach)
-        // Target the aggregate device (not the tap!) for kAudioAggregateDevicePropertyTapList
-        var tapListAddr = AudioObjectPropertyAddress(
-            mSelector: kAudioAggregateDevicePropertyTapList,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        
-        // The tap list is just an array of CFString UIDs (not dictionaries!)
-        var tapList: CFArray = [tapUIDCF] as CFArray
-        
-        let setStatus = AudioObjectSetPropertyData(
-            aggregateDeviceID,
-            &tapListAddr,
-            0, nil,
-            UInt32(MemoryLayout<CFArray>.size),
-            &tapList
-        )
-        
-        if setStatus != noErr {
-            Logger.error("Failed to add tap to aggregate", metadata: ["status": "\(setStatus)"])
-            // Don't fail - maybe the tap was already included
-        } else {
-            Logger.info("Tap added to aggregate device")
-        }
-        
         return true
     }
     
@@ -373,7 +411,8 @@ final class AudioEngine {
                 localSamples[i*2+1] = sample   // right
             }
             localSamples.withUnsafeBufferPointer { ptr in
-                ringBuffer?.write(ptr.baseAddress!, count: sampleCount)
+                let frameCount = sampleCount / 2  // stereo interleaved
+                ringBuffer?.write(ptr.baseAddress!, frameCount: frameCount)
             }
             
             ioProcCallbackCount += 1
@@ -389,6 +428,9 @@ final class AudioEngine {
             let samples = buffer.mData!.assumingMemoryBound(to: Float.self)
             
             // Calculate peak level for monitoring
+            let frameCount = Int(buffer.mDataByteSize) / Int(tapFormat.mBytesPerFrame)
+            let sampleCount = frameCount * Int(tapFormat.mChannelsPerFrame)
+            
             var peak: Float = 0
             var dcOffset: Float = 0
             for i in 0..<min(sampleCount, 1024) {
@@ -397,8 +439,8 @@ final class AudioEngine {
             }
             dcOffset /= Float(min(sampleCount, 1024))
             
-            // Write to ring buffer
-            let written = ringBuffer?.write(samples, count: sampleCount) ?? 0
+            // Write to ring buffer (using frame count)
+            let written = ringBuffer?.write(samples, frameCount: frameCount) ?? 0
             
             // Increment callback count
             ioProcCallbackCount += 1
@@ -479,19 +521,9 @@ final class AudioEngine {
         enable = 0
         AudioUnitSetProperty(au, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &enable, UInt32(MemoryLayout<UInt32>.size))
         
-        // CRITICAL: Configure stream format to match the tap format
-        // The tap delivers: 48kHz, Float32, interleaved stereo
-        var format = AudioStreamBasicDescription(
-            mSampleRate: 48000,
-            mFormatID: kAudioFormatLinearPCM,
-            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
-            mBytesPerPacket: 8,  // 2 channels * 4 bytes
-            mFramesPerPacket: 1,
-            mBytesPerFrame: 8,   // 2 channels * 4 bytes
-            mChannelsPerFrame: 2,
-            mBitsPerChannel: 32,
-            mReserved: 0
-        )
+        // CRITICAL: Configure stream format to match the tap format exactly
+        // Use the format read from the tap - Float32, interleaved/non-interleaved as reported
+        var format = tapFormat
         
         // Set the input format (what we provide to the AUHAL render callback)
         let fmtStatus = AudioUnitSetProperty(
@@ -502,7 +534,13 @@ final class AudioEngine {
             &format,
             UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
         )
-        Logger.info("Set AUHAL input format", metadata: ["status": "\(fmtStatus)", "rate": "48000", "ch": "2"])
+        Logger.info("Set AUHAL input format", metadata: [
+            "status": "\(fmtStatus)",
+            "rate": "\(Int(format.mSampleRate))",
+            "ch": "\(format.mChannelsPerFrame)",
+            "interleaved": "\((format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0)",
+            "formatID": "\(format.mFormatID)"
+        ])
         
         // Set render callback - use inRefCon to pass self, no closures allowed
         var callbackStruct = AURenderCallbackStruct(
@@ -547,56 +585,49 @@ final class AudioEngine {
         let bufferList = buffers.pointee
         
         var totalPeak: Float = 0
-        var totalReadCount = 0
-        var totalSampleCount = 0
+        var totalReadFrames: Int = 0
+        let requestedFrames = Int(frames)
         
+        // Read frames from ring buffer (handles interleaved/non-interleaved via format)
+        // For now assume interleaved stereo which matches our tap format
         for i in 0..<Int(bufferList.mNumberBuffers) {
             let buffer = bufferList.mBuffers
             guard buffer.mData != nil else { continue }
             
-            let sampleCount = Int(frames) * Int(buffer.mNumberChannels)
+            let channelCount = Int(buffer.mNumberChannels)
             let dest = buffer.mData!.assumingMemoryBound(to: Float.self)
             
-            // Read from ring buffer, zero if underflow
-            let readCount = ringBuffer?.read(into: dest, count: sampleCount) ?? 0
-            totalReadCount += readCount
-            totalSampleCount += sampleCount
+            // Read frames from ring buffer
+            // For interleaved data, each frame has all channels
+            let readFrames = ringBuffer?.read(into: dest, frameCount: requestedFrames) ?? 0
+            totalReadFrames += readFrames
+            let readSamples = readFrames * channelCount
             
-            // Calculate peak for logging and check for corruption
+            // Calculate peak for logging
+            let readCount = readFrames * channelCount
             var localPeak: Float = 0
-            var firstSample: Float = 0
             for j in 0..<readCount {
                 let sample = dest[j]
-                if j == 0 { firstSample = sample }
                 localPeak = max(localPeak, abs(sample))
                 totalPeak = max(totalPeak, abs(sample))
             }
             
-            // Check for corruption - if first sample differs wildly from last written
-            if readCount > 0 {
-                let diff = abs(firstSample - lastWrittenSample)
-                if diff > 1.0 {
-                    Logger.debug("Possible ring buffer discontinuity", metadata: [
-                        "firstSample": String(format: "%.4f", firstSample),
-                        "lastWritten": String(format: "%.4f", lastWrittenSample),
-                        "diff": String(format: "%.4f", diff)
-                    ])
-                }
-                lastWrittenSample = dest[readCount - 1]
-            }
-            
-            if readCount < sampleCount {
+            if readFrames < requestedFrames {
                 // Zero remaining samples (underflow)
-                for j in readCount..<sampleCount {
-                    dest[j] = 0
+                let samplesToZero = (requestedFrames - readFrames) * channelCount
+                let startIdx = readCount
+                for j in 0..<samplesToZero {
+                    dest[startIdx + j] = 0
                 }
             }
         }
         
+        totalReadFrames = totalReadFrames / Int(bufferList.mNumberBuffers > 0 ? bufferList.mNumberBuffers : 1)
+        
         // Log first 10 and occasionally
         renderCallbackCount += 1
         let fillRatio = ringBuffer?.fillRatio() ?? 0
-        let underflow = totalReadCount < totalSampleCount
+        let underflow = totalReadFrames < requestedFrames
         
         // Detect frozen audio - check if peak is identical to previous
         let isFrozen = abs(totalPeak - lastRenderPeak) < 0.0001 && totalPeak > 0.01
@@ -606,11 +637,11 @@ final class AudioEngine {
             var meta: [String: String] = [
                 "callback": "\(renderCallbackCount)",
                 "frames": "\(frames)",
-                "read": "\(totalReadCount)/\(totalSampleCount)",
+                "readFrames": "\(totalReadFrames)/\(requestedFrames)",
                 "peak": String(format: "%.4f", totalPeak),
                 "ringFill": String(format: "%.2f", fillRatio),
                 "underflow": "\(underflow)",
-                "haveData": "\(totalReadCount > 0)"
+                "haveData": "\(totalReadFrames > 0)"
             ]
             if isFrozen {
                 meta["FROZEN"] = "YES"

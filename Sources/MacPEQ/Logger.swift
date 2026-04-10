@@ -48,4 +48,8 @@ enum Logger {
     static func error(_ message: String, metadata: [String: String] = [:]) {
         log("ERROR", message, metadata: metadata)
     }
+    
+    static func warning(_ message: String, metadata: [String: String] = [:]) {
+        log("WARNING", message, metadata: metadata)
+    }
 }
