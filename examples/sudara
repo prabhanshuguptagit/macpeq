@@ -1,0 +1,431 @@
+// This is a quick example of how to use the CoreAudio API and the new Tapping
+// API to create a tap on the default audio device. You need macOS  14.2 or
+// later.
+
+// Build command:
+// clang -framework Foundation -framework CoreAudio main.m -o tapping
+
+// License: You're welcome to do whatever you want with this code. If you do
+// something cool please tell me though. I would love to hear about it!
+
+#include <CoreAudio/AudioHardware.h>
+#include <CoreAudio/AudioHardwareTapping.h>
+#include <CoreAudio/CATapDescription.h>
+#include <CoreAudio/CoreAudio.h>
+#include <Foundation/Foundation.h>
+
+void fourcc_to_string(UInt32 fourcc, char* str) {
+    str[0] = (fourcc >> 24) & 0xFF;
+    str[1] = (fourcc >> 16) & 0xFF;
+    str[2] = (fourcc >> 8) & 0xFF;
+    str[3] = fourcc & 0xFF;
+    str[4] = '\0';
+}
+
+void print_class_id_string(AudioObjectID objectId) {
+    AudioClassID class_id = 0;
+    AudioObjectPropertyAddress property_address
+        = { .mSelector = kAudioObjectPropertyClass,
+            .mScope = kAudioObjectPropertyScopeGlobal,
+            .mElement = kAudioObjectPropertyElementMain };
+
+    UInt32 data_size = sizeof(class_id);
+    OSStatus status = AudioObjectGetPropertyData(objectId, &property_address, 0,
+                                                 NULL, &data_size, &class_id);
+
+    char class_id_str[5];
+    fourcc_to_string(class_id, class_id_str);
+    printf("Class ID: %s\n", class_id_str);
+}
+
+// Note: This macro assumes "goto cleanup" is valid for the scope.
+#define CHK(call)                                                              \
+    do {                                                                       \
+        OSStatus s = call;                                                     \
+        if (s != noErr) {                                                      \
+            printf("Error on " #call ": %i\n", s);                             \
+            goto cleanup;                                                      \
+        }                                                                      \
+    } while (0)
+
+AudioDeviceID default_device() {
+    AudioDeviceID device_id;
+    UInt32 property_size = sizeof(device_id);
+    AudioObjectPropertyAddress property_address
+        = { kAudioHardwarePropertyDefaultOutputDevice,
+            kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+
+    OSStatus status = AudioObjectGetPropertyData(kAudioObjectSystemObject,
+                                                 &property_address, 0, NULL,
+                                                 &property_size, &device_id);
+    if (status != kAudioHardwareNoError) {
+        printf("Error getting the default audio device.\n");
+        return 0;
+    }
+
+    return device_id;
+}
+
+void get_uid_of_device(char* str, AudioDeviceID device_id) {
+    CFStringRef uid_string = NULL;
+    UInt32 property_size = sizeof(uid_string);
+
+    AudioObjectPropertyAddress property_address
+        = { kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain };
+    property_address.mSelector = kAudioDevicePropertyDeviceUID;
+
+    OSStatus status = AudioObjectGetPropertyData(
+        device_id, &property_address, 0, NULL, &property_size, &uid_string);
+
+    if (status == kAudioHardwareNoError) {
+        NSString* ns_str = [NSString stringWithString:(NSString*)uid_string];
+        const char* c_str = [ns_str UTF8String];
+        strcpy(str, c_str);
+    }
+}
+
+void print_tap_data(AudioObjectID id) {
+    {
+        CFStringRef r;
+        UInt32 property_size = sizeof(CFStringRef);
+        AudioObjectPropertyAddress property_address
+            = { kAudioTapPropertyUID, kAudioObjectPropertyScopeGlobal,
+                kAudioObjectPropertyElementMain };
+
+        AudioObjectGetPropertyData(id, &property_address, 0, NULL,
+                                   &property_size, &r);
+        NSLog(@"kAudioTapPropertyUID: %@", r);
+    }
+
+    {
+        CFStringRef r;
+        UInt32 property_size = sizeof(CFStringRef);
+        AudioObjectPropertyAddress property_address
+            = { kAudioTapPropertyDescription, kAudioObjectPropertyScopeGlobal,
+                kAudioObjectPropertyElementMain };
+
+        AudioObjectGetPropertyData(id, &property_address, 0, NULL,
+                                   &property_size, &r);
+        NSLog(@"kAudioTapPropertyDescription: %@", r);
+    }
+
+    {
+        AudioStreamBasicDescription r;
+        UInt32 property_size = sizeof(AudioStreamBasicDescription);
+        AudioObjectPropertyAddress property_address
+            = { kAudioTapPropertyFormat, kAudioObjectPropertyScopeGlobal,
+                kAudioObjectPropertyElementMain };
+
+        AudioObjectGetPropertyData(id, &property_address, 0, NULL,
+                                   &property_size, &r);
+
+        char format_str[5];
+        fourcc_to_string(r.mFormatID, format_str);
+
+        char format_flags_str[512];
+        memset(format_flags_str, 0, 512);
+
+        // Format flags to string
+        if (r.mFormatFlags & kAudioFormatFlagIsFloat) {
+            strcat(format_flags_str, "Float");
+        }
+        if (r.mFormatFlags & kAudioFormatFlagIsBigEndian) {
+            strcat(format_flags_str, " | BigEndian");
+        }
+        if (r.mFormatFlags & kAudioFormatFlagIsSignedInteger) {
+            strcat(format_flags_str, " | SignedInteger");
+        }
+        if (r.mFormatFlags & kAudioFormatFlagIsPacked) {
+            strcat(format_flags_str, " | BigEndPacked");
+        }
+        if (r.mFormatFlags & kAudioFormatFlagIsAlignedHigh) {
+            strcat(format_flags_str, " | AlignedHigh");
+        }
+        if (r.mFormatFlags & kAudioFormatFlagIsNonInterleaved) {
+            strcat(format_flags_str, " | NonInterleaved");
+        }
+        if (r.mFormatFlags & kAudioFormatFlagIsNonMixable) {
+            strcat(format_flags_str, " | NonMixable");
+        }
+
+        printf("kAudioTapPropertyDescription:\n"
+               "     SampleRate:%f\n"
+               "     FormatID: %s\n"
+               "     FormatFlags: %s\n"
+               "     BytesPerPacket:%u\n"
+               "     FramesPerPacket:%u\n"
+               "     ChannelsPerFrame: %u\n"
+               "     BytesPerFrame: %u\n"
+               "     BitsPerChannel:%u\n",
+               r.mSampleRate, format_str, format_flags_str, r.mBytesPerPacket,
+               r.mFramesPerPacket, r.mChannelsPerFrame, r.mBytesPerFrame,
+               r.mBitsPerChannel);
+    }
+}
+
+// Make ioproc callback
+OSStatus ioproc_callback(AudioObjectID inDevice, const AudioTimeStamp* inNow,
+                         const AudioBufferList* inInputData,
+                         const AudioTimeStamp* inInputTime,
+                         AudioBufferList* outOutputData,
+                         const AudioTimeStamp* inOutputTime,
+                         void* __nullable inClientData) {
+#if 1
+    if (inInputData != NULL) {
+        printf("inInputData:\n");
+        for (int i = 0; i < inInputData->mNumberBuffers; i++) {
+            printf("  Buffer %i:\n", i);
+            printf("    mNumberChannels: %u\n",
+                   inInputData->mBuffers[i].mNumberChannels);
+            printf("    mDataByteSize: %u\n",
+                   inInputData->mBuffers[i].mDataByteSize);
+        }
+    }
+    if (outOutputData != NULL) {
+        printf("outOutputData:\n");
+        for (int i = 0; i < outOutputData->mNumberBuffers; i++) {
+            printf("  Buffer %i:\n", i);
+            printf("    mNumberChannels: %u\n",
+                   outOutputData->mBuffers[i].mNumberChannels);
+            printf("    mDataByteSize: %u\n",
+                   outOutputData->mBuffers[i].mDataByteSize);
+        }
+    }
+#endif
+
+    // If you are using a global Tap rather than an output Tap you will need to
+    // manually compensate for the "real" number of channels the default output
+    // device has, rather than what Apple gives you in this callback.
+    bool global_tap = *(bool*)inClientData;
+    uint32_t real_num_channels = 0;
+    if (global_tap) {
+        // Note: In a real use of this API I would imagine you wouldn't call
+        // this every time the buffer is processed. You would probably set up a
+        // listener to see when the default device changes and send in the new
+        // number of channels.
+
+        AudioDeviceID output_device = default_device();
+        UInt32 property_size = sizeof(AudioBufferList);
+        AudioObjectPropertyAddress property_address
+            = { kAudioDevicePropertyStreamConfiguration,
+                kAudioObjectPropertyScopeOutput,
+                kAudioObjectPropertyElementMain };
+
+        AudioBufferList buffer_list;
+        OSStatus status
+            = AudioObjectGetPropertyData(output_device, &property_address, 0,
+                                         NULL, &property_size, &buffer_list);
+
+        // We are assuming there is only one buffer for this example. I believe
+        // MOTU interfaces have multiple buffers. Something to keep in mind.
+        real_num_channels = buffer_list.mBuffers[0].mNumberChannels;
+    }
+
+    printf("Real number of channels: %u\n", real_num_channels);
+
+    const uint32_t n_buffers = inInputData->mNumberBuffers;
+    for (uint32_t buffer = 0; buffer < n_buffers; buffer++) {
+        const uint32_t n_channels
+            = inInputData->mBuffers[buffer].mNumberChannels;
+        const uint32_t n_frames
+            = inInputData->mBuffers[buffer].mDataByteSize / sizeof(float);
+        const uint32_t n_frames_per_channel = n_frames / n_channels;
+
+        float* data = (float*)inInputData->mBuffers[buffer].mData;
+
+        for (uint32_t ch = 0; ch < n_channels; ch++) {
+            float volume_accum = 0;
+
+            for (uint32_t i = 0; i < n_frames_per_channel; i++) {
+                volume_accum += data[i * n_channels + ch];
+            }
+
+            if (real_num_channels == 0) {
+                // If we are not using a global tap then we can use the
+                volume_accum /= n_frames_per_channel;
+            } else {
+                // If we are using a global tap then we need to divide by the
+                // real number of channels the default output device has
+                // minus 2.
+
+                // Note: This has been shown as accurate in my testing. However,
+                // this may not be true in every case.
+                volume_accum
+                    /= n_frames_per_channel / (real_num_channels - 2.0);
+            }
+            printf("Channel %u: %f\n", ch, volume_accum);
+        }
+    }
+
+    return noErr;
+}
+
+static bool running = true;
+
+void stop(int signal) {
+    (void)signal;
+    running = false;
+}
+
+int main() {
+    // Set up signal handler
+    signal(SIGINT, stop);
+
+    // Initializing the variables at the top so we can jump to the cleanup with
+    // goto.
+    OSStatus status;
+    AudioObjectID aggregate_device_id = 0;
+    AudioDeviceIOProcID tap_io_proc_id = 0;
+    AudioObjectID tap = 0;
+    NSString* tap_uid = nil;
+    NSArray<NSDictionary*>* taps = nil;
+    NSDictionary* aggregate_device_properties = nil;
+
+    // Get the default output device to use in the Tap
+    // build_device_list();
+
+    // Pass an empty array becuase we would like to tap all processes
+    NSArray<NSNumber*>* processes = @[];
+
+    bool global_tap = true;
+    CATapDescription* tap_description = NULL;
+
+    if (global_tap) {
+        // Create a tap description for all processes without a specific output.
+        // Note: I believe there is a bug in the CoreAudio Tap API. If the
+        // default output device has 2 output channels this works as expected.
+        // But if you have a device with 4 output channels then the volume of
+        // the resulting buffer will be halved. You can extrapolate this to any
+        // number of channels.
+
+        // This bug is also present in ScreenCaptureKit if you use it on macOS
+        // 14.2 or later. The bug is not present in macOS 14.1 or earlier.
+
+        // A workaround for this issue could be to increase the volume of the
+        // audio in the output by the number of channels. Or simply use the
+        // other API to tap a specific output.
+
+        tap_description = [[CATapDescription alloc]
+            initStereoGlobalTapButExcludeProcesses:processes];
+    } else {
+
+        // Note: You can tap the default output by doing the following:
+        char default_device_uid[256];
+        get_uid_of_device(default_device_uid, default_device());
+        NSString* device = [NSString stringWithUTF8String:default_device_uid];
+
+        // This assumes we have a zeroth stream (see warning below) and we only
+        // want the first stream on the device.
+        
+        // Warning: Some devices may show up as being an output device without
+        // any streams. It's worth checking before passing a device here.
+        
+        tap_description = [[CATapDescription alloc] initWithProcesses:processes
+                                                         andDeviceUID:device
+                                                           withStream:0];
+    }
+
+    // If you set this to CATapMuted or CATapMutedWhenTapped you could take the
+    // audio received from the tap and route it through effects and back out to
+    // the default device. Just sayin'.
+    [tap_description setMuteBehavior:CATapUnmuted];
+    // This is probably not needed for a Private Tap.
+    [tap_description setName:@"MiniMetersTap"];
+    // Setting setPrivate to YES is required if you want to also set the
+    // Aggregate Device (which we will set up later) to private.
+    [tap_description setPrivate:YES];
+    // Setting setExclusive to YES means that the list of processes we passed in
+    // (none in this case) are the processes we would like to not include. If
+    // this was NO then we could capture only the processes we passed in.
+    [tap_description setExclusive:YES];
+
+    if (tap_description == nil) {
+        printf("Error creating tap description.\n");
+        goto cleanup;
+    }
+
+    CHK(AudioHardwareCreateProcessTap(tap_description, &tap));
+
+    print_class_id_string(tap);
+    print_tap_data(tap);
+
+    // You can either get the UID from the AudioObjectID (below) or use the UID
+    // from the CATapDescription. I am using the tap_description since it is in
+    // scope.
+#if 0
+
+    CFStringRef tap_uid;
+    UInt32 property_size = sizeof(CFStringRef);
+    AudioObjectPropertyAddress property_address
+        = { kAudioTapPropertyUID, kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain };
+
+    AudioObjectGetPropertyData(tap, &property_address, 0, NULL, &property_size,
+                               &tap_uid);
+#endif
+
+    // Note: In the CoreAudio/AudioHardware.h header file Apple states that in
+    // the section for Tap they define keys for creating the Tap, but they do
+    // not ever define them. However, SubTap (and many other types) use similar
+    // names for the keys so I just assumed they may work here. And they do (as
+    // of the time of writing this.)
+
+    tap_uid = [[tap_description UUID] UUIDString];
+    taps = @[
+        @{
+            @kAudioSubTapUIDKey : (NSString*)tap_uid,
+            @kAudioSubTapDriftCompensationKey : @YES,
+        },
+    ];
+
+    aggregate_device_properties = @{
+        @kAudioAggregateDeviceNameKey : @"MiniMetersAggregateDevice",
+        @kAudioAggregateDeviceUIDKey :
+            @"com.josephlyncheski.MiniMetersAggregateDevice",
+        @kAudioAggregateDeviceTapListKey : taps,
+        @kAudioAggregateDeviceTapAutoStartKey : @NO,
+        // If we set this to NO then I believe we need to make the Tap public as
+        // well.
+        @kAudioAggregateDeviceIsPrivateKey : @YES,
+    };
+
+    // Create the aggregate device
+    status = AudioHardwareCreateAggregateDevice(
+        (CFDictionaryRef)aggregate_device_properties, &aggregate_device_id);
+    if (status == 1852797029) {
+        printf("Aggregate device already exists.\n");
+        goto cleanup;
+    } else if (status != noErr) {
+        printf("Error creating aggregate device.\n");
+        goto cleanup;
+    }
+
+    // Attach callback to the aggregate device
+    CHK(AudioDeviceCreateIOProcID(aggregate_device_id, ioproc_callback,
+                                  &global_tap, &tap_io_proc_id));
+
+    // Start the aggregate device
+    CHK(AudioDeviceStart(aggregate_device_id, tap_io_proc_id));
+
+    // Just doing a busy loop to keep the program running. CTRL-C sends the
+    // signal to stop which changes running to false and cleans up the program.
+    while (running) {
+        sleep(1);
+    }
+
+cleanup:
+    if (aggregate_device_id != 0)
+        AudioDeviceStop(aggregate_device_id, tap_io_proc_id);
+
+    if (tap_io_proc_id != 0)
+        AudioDeviceDestroyIOProcID(aggregate_device_id, tap_io_proc_id);
+
+    if (tap != 0)
+        AudioHardwareDestroyProcessTap(tap);
+
+    if (tap_description != nil)
+        [tap_description release];
+
+    return 0;
+}
