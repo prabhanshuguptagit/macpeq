@@ -133,7 +133,8 @@ These are explicit anti-patterns. Do not deviate.
 3. **Do NOT process audio on the main thread** or any thread you don't own. All DSP happens inside the Core Audio IOProc / render callback.
 4. **Do NOT allocate memory inside render callbacks.** No `malloc`, no Swift `Array` resizing, no `String` creation, no `print()`. Pre-allocate everything.
 5. **Do NOT use locks in the audio thread.** Use double-buffering + atomic flag for parameter updates.
-6. **Do NOT target the `tapID` when setting `kAudioAggregateDevicePropertyTapList`** — always target `aggregateDeviceID`. (Apple sample code has this bug.)
+6. **Do NOT target the `tapID` when setting `kAudioAggregateDevicePropertyTapList`** — always target `aggregateDeviceID`. (Apple's own sample code has this bug — confirmed via Feedback FB17411663.)
+7. **Do NOT call `AVCaptureDevice.requestAccess(for: .audio)`** to request tap permission. That API requests *microphone* access, which is a completely different permission. The system audio tap permission is triggered automatically when the IOProc starts. See the Permissions section in section 6.
 
 ---
 
@@ -151,9 +152,9 @@ Each checkpoint has a **binary pass/fail gate**. Do not advance to the next chec
 
 **Implementation steps:**
 
-1. Create a macOS app target (SwiftUI shell). Add `NSAudioCaptureUsageDescription` to `Info.plist`.
-2. Request audio capture permission: `AVCaptureDevice.requestAccess(for: .audio)`.
-3. Read the default output device ID:
+1. Create a macOS app target (SwiftUI shell). Add `NSAudioCaptureUsageDescription` to `Info.plist` (enter manually — it's not in Xcode's dropdown). This is the usage string shown in the system permission prompt.
+   - Note: There is **no public API** to proactively check or request system audio tap permission. The system will prompt the user automatically the first time the aggregate device IOProc starts reading tap data. If the user denies, you get silence (not an error). See the Permissions section in section 6 for details.
+2. Read the default output device ID:
    ```
    var deviceID: AudioDeviceID
    var propSize = UInt32(MemoryLayout<AudioDeviceID>.size)
@@ -164,16 +165,32 @@ Each checkpoint has a **binary pass/fail gate**. Do not advance to the next chec
    )
    AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &propSize, &deviceID)
    ```
-4. Create a `CATapDescription` using `initStereoGlobalTapButExcludeProcesses(_:isMuted:)`.
+3. Create a `CATapDescription` using `initStereoGlobalTapButExcludeProcesses(_:)`.
    - **Exclude your own process** (`ProcessInfo.processInfo.processIdentifier`) to prevent feedback if the app ever produces sound.
-   - Set `isMuted: true` — this is critical. Without it, the original signal plays AND your passthrough copy plays = instant doubling.
-5. Call `AudioHardwareCreateProcessTap(&tapDescription, &tapID)`.
-6. Build an aggregate device dictionary:
+   - This convenience init automatically sets `exclusive = true` (meaning the process list is treated as an exclusion list) and configures stereo output. If you use a different init (e.g., `initWithProcesses:andDeviceUID:withStream:`), you must set `setExclusive(true)` manually.
+   - Set mute behavior: `tapDescription.setMuteBehavior(.muted)` — this is critical. The `CATapMuteBehavior` enum has three values: `.unmuted` (original signal still plays — you hear both), `.muted` (original signal is silenced — only your processed output plays), `.mutedWhenTapped` (mutes only while actively tapping). For an EQ app that replaces the output, use `.muted`.
+   - Set private: `tapDescription.setPrivate(true)` — required when the aggregate device will also be private.
+4. Call `AudioHardwareCreateProcessTap(tapDescription, &tapID)`.
+5. Get the tap's UUID string: `let tapUID = tapDescription.uuid.uuidString`
+6. Build an aggregate device dictionary. **The tap list is an array of dictionaries, not an array of UID strings:**
+   ```swift
+   let aggregateDict: [String: Any] = [
+       kAudioAggregateDeviceNameKey: "MacPEQ",
+       kAudioAggregateDeviceUIDKey: "com.macpeq.aggregate",
+       kAudioAggregateDeviceTapListKey: [
+           [
+               kAudioSubTapUIDKey: tapUID,
+               kAudioSubTapDriftCompensationKey: true
+           ]
+       ],
+       kAudioAggregateDeviceTapAutoStartKey: false,
+       kAudioAggregateDeviceIsPrivateKey: true
+   ]
    ```
-   kAudioAggregateDeviceTapListKey: [tapUID]
-   kAudioAggregateDeviceIsPrivateKey: true
-   ```
+   **Critical:** `kAudioSubTapDriftCompensationKey: true` tells Core Audio to handle clock drift between the tap and the aggregate device at the HAL level. This is the correct way to handle drift — do NOT rely solely on manual frame drop/duplicate.
 7. Call `AudioHardwareCreateAggregateDevice(&aggregateDict, &aggregateDeviceID)`.
+   - Handle OSStatus `1852797029` — this means an aggregate device with the same UID already exists (stale from a previous crash or unclean shutdown). To recover, you need the stale device's `AudioObjectID` (which you don't have from the crash). Look it up by translating the UID string to a device ID using `kAudioHardwarePropertyTranslateUIDToDevice` on `kAudioObjectSystemObject`, then call `AudioHardwareDestroyAggregateDevice` with the resolved ID, then retry creation.
+   - If this error persists after destroy+retry (as some developers have reported), use a unique UID per session — e.g., append a UUID suffix to `"com.macpeq.aggregate"`. This avoids the collision entirely at the cost of potentially leaking stale aggregate devices in the HAL's registry (they clean up on reboot).
 8. Read `kAudioTapPropertyFormat` from the tap → `AudioStreamBasicDescription`. Log the format. **Expect Float32, non-interleaved.** If the format differs (e.g., interleaved, Int16 — possible with some Bluetooth devices), set up an `AudioConverter` in the IOProc to convert to Float32 non-interleaved before writing to the ring buffer. If converter setup fails, log the error and enter disabled state (see Failure Modes in section 6).
 9. Register an IOProc on the aggregate device via `AudioDeviceCreateIOProcIDWithBlock`. Inside:
    - Copy the input buffer list into a `TPCircularBuffer`.
@@ -193,7 +210,8 @@ Each checkpoint has a **binary pass/fail gate**. Do not advance to the next chec
 - Always target `aggregateDeviceID` (not `tapID`) when setting/getting `kAudioAggregateDevicePropertyTapList`.
 - Sample rate mismatch between tap and output device is **common** (e.g., 48kHz tap + 44.1kHz USB DAC). The AudioConverter handles this transparently. Do NOT assume rates will match — always check and set up conversion if needed.
 - The ring buffer size should be at least 4× the expected buffer size to handle timing jitter between the two callback clocks.
-- **Implement clock drift handling immediately** (see "Clock Drift Handling" in section 6). Without it, passthrough works for minutes but degrades over hours. Add fill-level monitoring and frame drop/duplicate logic in the AUHAL render callback from day one.
+- **Clock drift is handled primarily by `kAudioSubTapDriftCompensationKey: true`** in the aggregate device dictionary (step 6). This enables HAL-level drift compensation. Additionally, add ring buffer fill-level monitoring in the AUHAL render callback as a health check (see "Clock Drift Handling" in section 6). If fill level drifts despite HAL compensation, something else is wrong.
+- **Stereo global tap + multi-channel output device = volume attenuation.** When using `initStereoGlobalTapButExcludeProcesses` with an output device that has more than 2 channels (e.g., a 4-channel audio interface), the tapped buffer's volume will be attenuated proportionally. For a 4-channel device, expect ~6dB attenuation. This is a known Core Audio bug also present in ScreenCaptureKit. For most users (built-in speakers, headphones, AirPods — all stereo), this won't matter. If supporting multi-channel interfaces, compensate by scaling the input buffer or use a device-specific tap (`initWithProcesses:andDeviceUID:withStream:`) instead.
 
 ---
 
@@ -213,13 +231,14 @@ Each checkpoint has a **binary pass/fail gate**. Do not advance to the next chec
    - **Clear the ring buffer** (stale samples from the old device's sample rate will cause noise).
    - Re-read the new default output device ID.
    - Rebuild everything in order: tap → aggregate device → ring buffer → AUHAL.
-   - Log the new tap format. **Assert sample rates match before starting.**
+   - Log the new tap format. **If sample rates differ between tap and output device, set up an AudioConverter** (same as CP1 step 10).
 3. Test with: built-in speakers → Bluetooth headphones → AirPods → USB DAC → back to speakers.
 
 **Known gotchas:**
-- AirPods may negotiate different sample rates depending on mode (24kHz SCO vs 48kHz A2TP). Your rebuild must handle this — read the new tap format, set AUHAL to match.
+- AirPods may negotiate different sample rates depending on mode (24kHz SCO vs 48kHz A2DP). Your rebuild must handle this — read the new tap format, set up AudioConverter if rates differ.
 - The serial queue for rebuilds prevents races if the user switches devices rapidly.
 - Don't rebuild on main thread — the Core Audio calls can block.
+- If aggregate device creation fails with `1852797029` during rebuild, the previous destroy didn't complete cleanly. Handle the same way as CP1 step 7 — destroy stale, retry.
 
 ---
 
@@ -292,7 +311,7 @@ Each checkpoint has a **binary pass/fail gate**. Do not advance to the next chec
    ```
 3. Hardcode 10 bands at ISO frequencies: 31, 63, 125, 250, 500, 1k, 2k, 4k, 8k, 16k Hz.
 4. **Thread-safe parameter updates:** Double-buffer the coefficient arrays. UI thread writes to the inactive buffer and flips an atomic flag. Audio thread reads the active buffer. No locks.
-5. **Add a pre-output hard limiter** (sample-level clamp to ±1.0) to prevent clipping when multiple bands boost simultaneously. This is a safety measure — without it, stacking boosts produces values >1.0 which clip at the DAC.
+5. **Add output gain protection** (see "Output Gain Protection" in section 6). Implement both stages: auto-gain reduction as the primary mechanism, plus hard safety clamp as fallback. This is mandatory from CP4 onward — without it, stacking boosts produces values >1.0 which clip at the DAC.
 
 **Automated verification (unit test — THIS IS THE GATE):**
 
@@ -527,7 +546,7 @@ reads activeBuffer[activeIndex]       writes to coefficients[1 - activeIndex]
 next callback sees new activeIndex → reads new coefficients
 ```
 
-Use `OSAtomicCompareAndSwap32` or Swift's `Atomic` (from the Synchronization module in Swift 6, or `UnsafeAtomic` from swift-atomics). The key constraint: the audio thread never blocks.
+Use Swift's `Atomic` (from the Synchronization module in Swift 6, or `UnsafeAtomic` from swift-atomics package). Do NOT use the deprecated `OSAtomic` family. The key constraint: the audio thread never blocks.
 
 ### Swift Real-Time Thread Safety
 
@@ -564,7 +583,9 @@ During drag interactions, the UI can fire parameter updates at 60–120Hz (one p
 When creating the `CATapDescription`, exclude your own process:
 ```swift
 let myPID = ProcessInfo.processInfo.processIdentifier
-let tap = CATapDescription(stereoGlobalTapButExcludeProcesses: [myPID], isMuted: true)
+let tap = CATapDescription(stereoGlobalTapButExcludeProcesses: [myPID])
+tap.setMuteBehavior(.muted)
+tap.setPrivate(true)
 ```
 This prevents feedback loops if MacPEQ ever produces incidental audio (system alerts, accessibility sounds, etc.).
 
@@ -580,7 +601,7 @@ The tap and the output device may run at different nominal sample rates (common:
 5. Sample rate conversion happens *after* EQ processing, in the AUHAL render callback, via `AudioConverterFillComplexBuffer`. The converter pulls from the ring buffer (which contains EQ-processed audio at the tap rate) and outputs at the device rate.
 6. Pre-allocate the converter's intermediate buffer during setup. Size it based on the ratio: `outputFrames * (tapRate / outputRate) * 1.1` (10% margin for rounding).
 
-**When the converter is active, clock drift correction (frame drop/dup) is still needed** — the converter handles the rate ratio, but the two hardware clocks still drift independently.
+**When the converter is active, `kAudioSubTapDriftCompensationKey` still handles clock drift** — the converter handles the rate ratio, while HAL drift compensation handles the independent clock drift. Ring buffer fill monitoring remains active as a safety net.
 
 ### Output Gain Protection
 
@@ -638,23 +659,23 @@ The ring buffer should NOT be filled to capacity during normal operation. A full
 
 The tap IOProc and the AUHAL output run on independent clock domains. Even if both report the same nominal sample rate (e.g., 48000Hz), their actual hardware clocks will drift relative to each other over time.
 
-**What happens without correction:**
-- If tap produces slightly faster than AUHAL consumes → ring buffer slowly fills → latency creeps up → eventually overflows
-- If AUHAL consumes slightly faster than tap produces → ring buffer slowly empties → underflow → clicks/silence
+**Primary mechanism: `kAudioSubTapDriftCompensationKey`**
 
-**Detection:**
-In the AUHAL render callback, track the ring buffer fill level every callback:
+The aggregate device dictionary should include `kAudioSubTapDriftCompensationKey: true` in the tap list entry (see CP1 step 6). This tells Core Audio's HAL to perform drift compensation at the aggregate device level — the same mechanism used for multi-device aggregate devices. This is the correct, Apple-supported approach and handles drift transparently.
+
+**Secondary mechanism: ring buffer fill monitoring (safety net)**
+
+Even with HAL-level drift compensation, monitor the ring buffer fill level as a health check:
 ```swift
 let available = TPCircularBufferAvailableBytes(&ringBuffer)
 let fillRatio = Float(available) / Float(ringBufferCapacity)
 ```
 
-**Correction (simple, sufficient for v1):**
-- If `fillRatio > 0.7` (drifting full): **drop** one frame from the ring buffer read — skip one frame of input. This is inaudible.
-- If `fillRatio < 0.3` (drifting empty): **duplicate** the last frame — repeat the previous output sample once. Also inaudible at single-frame granularity.
-- Log drift corrections so you can monitor frequency. If corrections happen more than once per second, something is wrong (sample rate mismatch, not drift).
+- If `fillRatio > 0.7` (drifting full despite drift compensation): **drop** one frame from the ring buffer read. Log a warning — this suggests drift compensation isn't working as expected.
+- If `fillRatio < 0.3` (drifting empty): **duplicate** the last frame. Log a warning.
+- If corrections happen more than once per second, something is wrong (likely a sample rate mismatch, not drift — check the AudioConverter path).
 
-**When to implement:** CP1. This is not a future optimization — without it, the passthrough will work for minutes but degrade over hours. The agent should add fill-level monitoring and frame drop/dup from the very first working passthrough.
+**When to implement:** CP1. Enable `kAudioSubTapDriftCompensationKey` from day one, and add fill-level monitoring as a diagnostic. The manual frame drop/dup should rarely if ever fire when HAL drift compensation is active.
 
 ---
 
@@ -664,9 +685,9 @@ Define explicit behavior for every failure the agent must handle:
 
 | Failure | Behavior |
 |---|---|
-| Audio capture permission denied | Show a one-time dialog explaining why permission is needed. Link to System Settings > Privacy > Audio. Do not start the audio engine. Menu bar icon shows "disabled" state. |
+| Audio capture permission denied | There is no public API to detect this. If the user denies permission, the tap delivers silence — not an error. **Detect by monitoring:** if the IOProc is firing but the ring buffer contains only zeros for >3 seconds while system audio should be playing, assume permission was denied. Show a dialog: "MacPEQ needs permission to process system audio. Open System Settings > Privacy & Security > Screen & System Audio Recording and enable MacPEQ." Include a button that opens the relevant System Settings pane via URL scheme. Menu bar icon shows "no permission" state. |
 | `AudioHardwareCreateProcessTap` fails | Log the `OSStatus` error code. Show a user-facing alert: "MacPEQ couldn't tap system audio. This requires macOS 14.2+." Retry once after 1 second. If retry fails, enter disabled state. |
-| `AudioHardwareCreateAggregateDevice` fails | Same as above — log, alert, retry once. |
+| `AudioHardwareCreateAggregateDevice` fails | Log the `OSStatus`. **Special case:** error code `1852797029` means an aggregate device with the same UID already exists (e.g., from a previous crash without cleanup). Destroy the stale device first with `AudioHardwareDestroyAggregateDevice`, then retry. For other errors: alert, retry once, disabled state. |
 | AUHAL unit fails to initialize | Log error. Fall back to disabled state. Do not crash. |
 | Sample rate mismatch (tap ≠ output device) | This is normal and expected (e.g., 48kHz tap + 44.1kHz DAC). Set up an `AudioConverter` for rate conversion in the render path (see CP1 step 10). If converter setup fails, log both rates and enter disabled state with user alert. |
 | Format is not Float32 non-interleaved | Log the actual format. Attempt conversion via `AudioConverterNew` / `AudioConverterConvertBuffer` in the IOProc before writing to the ring buffer. If conversion setup fails, enter disabled state. |
@@ -677,6 +698,32 @@ Define explicit behavior for every failure the agent must handle:
 | App Support directory not writable | Fall back to in-memory presets only. Log the error. User presets won't persist across launches — inform user. |
 
 **General principle:** Never crash. Degrade to passthrough (no EQ) or disabled state. Always log the `OSStatus` code.
+
+---
+
+### Permissions
+
+System audio tap permissions on macOS are poorly documented and behave differently from microphone permissions. This section consolidates what's known from real implementations (AudioCap, audiotee, SoundPusher).
+
+**Key facts:**
+
+1. **`NSAudioCaptureUsageDescription`** must be in `Info.plist`. This is the usage string shown in the permission prompt. Without it, the tap will silently produce no data. Enter it manually in Xcode — it's not in the dropdown.
+
+2. **There is no public API to check or request system audio tap permission.** Unlike microphone access (`AVCaptureDevice.requestAccess(for: .audio)`), the tap permission has no equivalent. Do NOT call `AVCaptureDevice.requestAccess(for: .audio)` — that requests *microphone* access, which is a completely separate permission and not what MacPEQ needs.
+
+3. **The permission prompt appears automatically** the first time the app starts reading from the aggregate device (i.e., when `AudioDeviceStart` is called and the IOProc begins receiving data). The system shows a dialog asking the user to allow "Screen & System Audio Recording" for your app.
+
+4. **If the user denies permission, you get silence — not an error.** The IOProc will fire normally, the buffers will contain valid data structures, but all samples will be zero. There is no `OSStatus` error or callback notification. The only way to detect denial is to monitor for sustained silence (see Failure Modes table).
+
+5. **The permission appears under "Privacy & Security > Screen & System Audio Recording"** in System Settings — not under "Microphone." To direct the user there programmatically: `NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)`.
+
+6. **A purple dot appears in the menu bar** while the tap is active, similar to the green dot for camera access. This is system-level and cannot be suppressed. Users should expect to see it.
+
+7. **AudioCap's TCC probing approach** (using private TCC framework APIs) can proactively check permission state, but this is not App Store safe and may break in future macOS versions. For MacPEQ, rely on the automatic prompt + silence detection approach.
+
+8. **Code signing matters.** The app must be properly signed for the permission prompt to appear. When running from Xcode during development, Xcode's signature is used. Some third-party terminals (iTerm, VS Code terminal) may not trigger the permission prompt — use Terminal.app or run the built .app bundle directly if testing the permission flow.
+
+9. **Tapping a device with input streams requires ADDITIONAL microphone permission** (confirmed by SoundPusher). If the user's default output device also has input streams (e.g., some USB audio interfaces, combined input/output devices), the system will prompt for microphone access in addition to system audio recording. MacPEQ uses a global stereo tap (not a device-specific tap), so this should not typically apply — but be aware of it if the agent switches to a device-specific tap for any reason.
 
 ---
 
@@ -701,8 +748,7 @@ Beyond the core impulse response test, add these edge-case tests:
 |---|---|---|
 | TPCircularBuffer | SPM: `https://github.com/michaeltyson/TPCircularBuffer` | Lock-free ring buffer |
 | Accelerate (vDSP) | System framework | FFT for unit tests, potentially for SIMD filter processing |
-| AVFoundation | System framework | Audio capture permission request |
-| CoreAudio / AudioToolbox | System frameworks | HAL API, AUHAL, process taps |
+| CoreAudio / AudioToolbox | System frameworks | HAL API, AUHAL, process taps, AudioConverter |
 | SMAppService | System framework | Launch at login |
 
 No third-party UI dependencies. No virtual audio drivers. No kernel extensions.
@@ -749,3 +795,19 @@ CP1 (passthrough) ─── must pass ──→ CP2 (device switching) ───
 | 7 | Manual: save preset, quit app, reopen, load preset — bands match. Import/export round-trips. |
 | 8 | Manual: close EQ window, audio keeps processing. Menu bar controls work. App launches at login. |
 | 9 | Manual: switch between devices, confirm different EQ loads for each. |
+
+---
+
+## 10. Reference Implementations
+
+These are real, working implementations of Core Audio taps that the agent should consult if stuck on the tap/aggregate device setup. They confirm the API patterns used in this PRD.
+
+| Reference | URL | What it demonstrates |
+|---|---|---|
+| **sudara's gist** (Obj-C) | https://gist.github.com/sudara/34f00efad69a7e8ceafa078ea0f76f6f | Minimal tap example. Shows `CATapDescription`, `setMuteBehavior`, `kAudioSubTapDriftCompensationKey`, aggregate device dictionary structure with tap list as array of dictionaries. |
+| **audiotee** (Swift CLI) | https://github.com/makeusabrew/audiotee | Full capture-to-stdout tool. `AudioTapManager` and `AudioRecorder` are the key classes. Shows IOProc callback, format handling, sample rate conversion via AudioConverter. |
+| **AudioCap** (Swift/SwiftUI) | https://github.com/insidegui/AudioCap | GUI app for recording system/process audio. Shows the complete tap→aggregate→IOProc→file flow. Also demonstrates TCC permission probing (private API — reference only, don't use in production). |
+| **SoundPusher** (C++/Obj-C) | https://github.com/q-p/SoundPusher | Established audio app using taps since v1.5. Key insight: aggregate device should contain ONLY the tap, not also the device being tapped. Also confirms that tapping a device with input streams requires additional microphone permission. |
+| **Apple docs** | https://developer.apple.com/documentation/coreaudio/capturing-system-audio-with-core-audio-taps | Official documentation. Contains the `kAudioAggregateDevicePropertyTapList` bug (uses tapID instead of aggregateDeviceID). Read the CoreAudio C headers directly for better documentation than the web docs. |
+
+**Note on the Apple documentation bug:** Apple's own sample code for modifying `kAudioAggregateDevicePropertyTapList` incorrectly uses `tapID` as the target `AudioObjectID` in both `AudioObjectGetPropertyData` and `AudioObjectSetPropertyData`. The correct target is `aggregateDeviceID`. This has been filed as Feedback FB17411663. All third-party implementations work around this.
