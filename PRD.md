@@ -251,6 +251,9 @@ Each checkpoint has a **binary pass/fail gate**. Do not advance to the next chec
 - Log `kAudioTapPropertyFormat` — processing must be in the same format. If the tap delivers Float32 non-interleaved, process Float32 non-interleaved. Mismatch → noise or silence.
 - Filter state must NOT be reset between callbacks. The `x1, x2, y1, y2` values carry signal continuity.
 
+**Implementation notes:**
+- **N-channel gap (deferred to CP4):** The non-interleaved path only processes buffer indices 0 and 1. Channels 3+ pass through unfiltered. This is acceptable for CP2 (stereo proof-of-concept) but must be addressed when generalizing to `[[BiquadFilter]]` for arbitrary channel counts in CP4.
+- **Filter state persistence:** Use `if var left = leftFilter` binding in the render callback, then save mutated filter back to the property. The compiler elides copies for small structs (7 floats) in optimized builds.
 ---
 
 

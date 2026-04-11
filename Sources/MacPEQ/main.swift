@@ -1,7 +1,8 @@
 import Foundation
 
-// CP1: Simple CLI audio passthrough test
-// Usage: swift run MacPEQ
+// MacPEQ - CP2: Single Biquad Filter
+// Config: +6dB peak at 1kHz, Q=1.0
+// Usage: swift run MacPEQ (or open MacPEQ.app)
 // Press Ctrl-C to stop
 
 fileprivate var gEngine: Any?
@@ -19,7 +20,7 @@ if #available(macOS 14.2, *) {
     
     var engine: AudioEngine?
     
-    Logger.info("MacPEQ CP1 - Audio Passthrough Test")
+    Logger.info("MacPEQ starting - CP2: Single Biquad Filter")
     
     engine = AudioEngine()
     gEngine = engine

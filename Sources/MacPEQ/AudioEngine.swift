@@ -22,9 +22,9 @@ fileprivate func ioProcCallback(
 }
 
 /// AudioEngine manages the complete audio pipeline:
-/// System Tap → IOProc → RingBuffer → AUHAL Output → Default Device
+/// System Tap → IOProc → RingBuffer → EQ Processing → AUHAL Output → Default Device
 ///
-/// CP1: Pure passthrough, no EQ processing
+/// CP2: Single biquad filter (hardcoded +6dB peak at 1kHz)
 @available(macOS 14.2, *)
 final class AudioEngine {
     private var tapID: AudioObjectID = 0
@@ -34,6 +34,11 @@ final class AudioEngine {
     private var isRunning = false
     private var tapFormat = AudioStreamBasicDescription()
     private let ringBufferFrames: Int32 = 16384
+    
+    // CP2: Single biquad filter per channel
+    private var leftFilter: BiquadFilter?
+    private var rightFilter: BiquadFilter?
+    private var filterEnabled: Bool = true
     
     private func getProperty<T>(
         of objectID: AudioObjectID,
@@ -69,7 +74,7 @@ final class AudioEngine {
     }
     
     func start() -> Bool {
-        Logger.info("Starting AudioEngine (CP1: passthrough)")
+        Logger.info("Starting AudioEngine (CP2: single biquad filter)")
         
         // 1. Get default output device
         guard let defaultDeviceID = getDefaultOutputDevice() else {
@@ -339,8 +344,38 @@ final class AudioEngine {
     }
 
     
+    /// CP2: Initialize single biquad filter once sample rate is known
+    /// Hardcoded: +6dB peak at 1kHz, Q=1.0
+    private func initFilters(sampleRate: Float) {
+        leftFilter = BiquadMath.makeFilter(
+            type: .peak, frequency: 1000.0, gain: 6.0, q: 1.0, sampleRate: sampleRate
+        )
+        rightFilter = BiquadMath.makeFilter(
+            type: .peak, frequency: 1000.0, gain: 6.0, q: 1.0, sampleRate: sampleRate
+        )
+        
+        #if DEBUG
+        if let f = leftFilter {
+            Logger.debug("Filter coefficients", metadata: [
+                "b0": "\(String(format: "%.6f", f.b0))",
+                "b1": "\(String(format: "%.6f", f.b1))",
+                "b2": "\(String(format: "%.6f", f.b2))",
+                "a1": "\(String(format: "%.6f", f.a1))",
+                "a2": "\(String(format: "%.6f", f.a2))"
+            ])
+        }
+        #endif
+        
+        Logger.info("CP2: Single biquad filter active", metadata: [
+            "type": "peak", "freq": "1000Hz", "gain": "+6dB", "q": "1.0", "rate": "\(Int(sampleRate))"
+        ])
+    }
+    
     private func createAUHALOutput(defaultDeviceID: AudioDeviceID) -> Bool {
         Logger.info("Creating AUHAL output unit")
+        
+        // Initialize filters with actual sample rate
+        initFilters(sampleRate: Float(tapFormat.mSampleRate))
         
         // Create AUHAL output unit
         var compDesc = AudioComponentDescription(
@@ -458,18 +493,48 @@ final class AudioEngine {
         let bufferList = UnsafeMutableAudioBufferListPointer(buffers)
         let requestedFrames = Int(frames)
         
+        // CP2: Single biquad filter applied per-channel after reading from ring buffer
+        // Handle both non-interleaved (separate buffer per channel) and interleaved (single buffer)
+        var bufferIndex = 0
         for buffer in bufferList {
-            guard buffer.mData != nil else { continue }
+            guard buffer.mData != nil else { bufferIndex += 1; continue }
             
             let channelCount = Int(buffer.mNumberChannels)
             let dest = buffer.mData!.assumingMemoryBound(to: Float.self)
             
+            // Read from ring buffer into output buffer
             let readFrames = ringBuffer?.read(into: dest, frameCount: requestedFrames) ?? 0
             
+            // Zero-fill any underrun
             if readFrames < requestedFrames {
                 let zeroSamples = (requestedFrames - readFrames) * channelCount
                 memset(dest.advanced(by: readFrames * channelCount), 0, zeroSamples * MemoryLayout<Float>.size)
             }
+            
+            // CP2: Apply single biquad filter per channel (if initialized, enabled, and we have data)
+            if filterEnabled && readFrames > 0,
+               var left = leftFilter, var right = rightFilter {
+                if channelCount == 1 {
+                    // Non-interleaved: separate buffer per channel
+                    if bufferIndex == 0 {
+                        left.processBuffer(dest, frameCount: readFrames)
+                        leftFilter = left  // Save state back
+                    } else if bufferIndex == 1 {
+                        right.processBuffer(dest, frameCount: readFrames)
+                        rightFilter = right  // Save state back
+                    }
+                } else if channelCount >= 2 {
+                    // Interleaved: frame-by-frame processing (cache-friendly)
+                    for frame in 0..<readFrames {
+                        let idx = frame * channelCount
+                        dest[idx]     = left.process(dest[idx])
+                        dest[idx + 1] = right.process(dest[idx + 1])
+                    }
+                    leftFilter = left   // Save state back
+                    rightFilter = right // Save state back
+                }
+            }
+            bufferIndex += 1
         }
         
         return noErr
