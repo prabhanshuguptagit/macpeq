@@ -1,7 +1,6 @@
 import CoreAudio
 import AudioToolbox
 import Foundation
-import AVFoundation
 
 /// C function for IOProc callback - must be at file scope
 @available(macOS 14.2, *)
@@ -28,21 +27,46 @@ fileprivate func ioProcCallback(
 /// CP1: Pure passthrough, no EQ processing
 @available(macOS 14.2, *)
 final class AudioEngine {
-    
-    // MARK: - Audio Objects
-    
     private var tapID: AudioObjectID = 0
     private var aggregateDeviceID: AudioObjectID = 0
     private var outputAU: AudioUnit?
-    
-    // MARK: - State
-    
     private var ringBuffer: RingBuffer?
     private var isRunning = false
-    private var tapFormat = AudioStreamBasicDescription()  // Actual tap format
-    private let ringBufferFrames: Int32 = 16384  // ~340ms at 48kHz
+    private var tapFormat = AudioStreamBasicDescription()
+    private let ringBufferFrames: Int32 = 16384
     
-    // MARK: - Lifecycle
+    private func getProperty<T>(
+        of objectID: AudioObjectID,
+        selector: AudioObjectPropertySelector,
+        value: inout T
+    ) -> OSStatus {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size = UInt32(MemoryLayout<T>.size)
+        return AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &value)
+    }
+    
+    private func getProperty<T, Q>(
+        of objectID: AudioObjectID,
+        selector: AudioObjectPropertySelector,
+        qualifier: inout Q,
+        value: inout T
+    ) -> OSStatus {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size = UInt32(MemoryLayout<T>.size)
+        return AudioObjectGetPropertyData(
+            objectID, &address,
+            UInt32(MemoryLayout<Q>.size), &qualifier,
+            &size, &value
+        )
+    }
     
     func start() -> Bool {
         Logger.info("Starting AudioEngine (CP1: passthrough)")
@@ -55,7 +79,7 @@ final class AudioEngine {
         Logger.info("Default output device", metadata: ["id": "\(defaultDeviceID)"])
         
         // 2. Create tap description
-        guard createTap() else {
+        guard createTap(for: defaultDeviceID) else {
             Logger.error("Failed to create audio tap")
             return false
         }
@@ -121,20 +145,7 @@ final class AudioEngine {
     
     private func getDefaultOutputDevice() -> AudioDeviceID? {
         var deviceID: AudioDeviceID = 0
-        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        
-        let status = AudioObjectGetPropertyData(
-            AudioObjectID(kAudioObjectSystemObject),
-            &address,
-            0, nil,
-            &size, &deviceID
-        )
-        
+        let status = getProperty(of: AudioObjectID(kAudioObjectSystemObject), selector: kAudioHardwarePropertyDefaultOutputDevice, value: &deviceID)
         guard status == noErr else {
             Logger.error("AudioObjectGetPropertyData failed", metadata: ["status": "\(status)"])
             return nil
@@ -142,26 +153,10 @@ final class AudioEngine {
         return deviceID
     }
     
-    /// Translates a PID to an AudioObjectID process object
     private func translatePIDToProcessObject(_ pid: Int32) -> AudioObjectID? {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyTranslatePIDToProcessObject,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
         var processObject: AudioObjectID = 0
-        var size = UInt32(MemoryLayout<AudioObjectID>.size)
         var mutablePid = pid
-        
-        let status = AudioObjectGetPropertyData(
-            AudioObjectID(kAudioObjectSystemObject),
-            &address,
-            UInt32(MemoryLayout<pid_t>.size),
-            &mutablePid,
-            &size,
-            &processObject
-        )
-        
+        let status = getProperty(of: AudioObjectID(kAudioObjectSystemObject), selector: kAudioHardwarePropertyTranslatePIDToProcessObject, qualifier: &mutablePid, value: &processObject)
         guard status == noErr, processObject != kAudioObjectUnknown else {
             Logger.error("Failed to translate PID", metadata: ["pid": "\(pid)", "status": "\(status)"])
             return nil
@@ -170,26 +165,11 @@ final class AudioEngine {
     }
     
     @available(macOS 14.2, *)
-    private func createTap() -> Bool {
-        // Try device-specific tap instead of global tap for better mute behavior
-        // Get default output device UID
-        guard let defaultDeviceID = getDefaultOutputDevice() else {
-            Logger.error("Failed to get default output device for tap")
-            return false
-        }
-        
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyDeviceUID,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var size = UInt32(MemoryLayout<CFString>.size)
+    private func createTap(for deviceID: AudioDeviceID) -> Bool {
         var deviceUIDCF: CFString = "" as CFString
-        
         let uidStatus = withUnsafeMutablePointer(to: &deviceUIDCF) { ptr in
-            AudioObjectGetPropertyData(defaultDeviceID, &address, 0, nil, &size, ptr)
+            getProperty(of: deviceID, selector: kAudioDevicePropertyDeviceUID, value: &ptr.pointee)
         }
-        
         guard uidStatus == noErr else {
             Logger.error("Failed to get device UID", metadata: ["status": "\(uidStatus)"])
             return false
@@ -235,16 +215,8 @@ final class AudioEngine {
             return false
         }
         
-        // Log tap format
-        var formatAddr = AudioObjectPropertyAddress(
-            mSelector: kAudioTapPropertyFormat,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
         var format = AudioStreamBasicDescription()
-        var formatSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-        
-        let fmtStatus = AudioObjectGetPropertyData(tapID, &formatAddr, 0, nil, &formatSize, &format)
+        let fmtStatus = getProperty(of: tapID, selector: kAudioTapPropertyFormat, value: &format)
         if fmtStatus == noErr {
             Logger.info("Tap format", metadata: [
                 "rate": "\(Int(format.mSampleRate))",
@@ -263,27 +235,16 @@ final class AudioEngine {
     }
     
     private func createAggregateDevice() -> Bool {
-        // Get tap UID string
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioTapPropertyUID,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var size = UInt32(MemoryLayout<CFString>.size)
         var tapUIDCF: CFString = "" as CFString
-        
         let uidStatus = withUnsafeMutablePointer(to: &tapUIDCF) { ptr in
-            AudioObjectGetPropertyData(tapID, &address, 0, nil, &size, ptr)
+            getProperty(of: tapID, selector: kAudioTapPropertyUID, value: &ptr.pointee)
         }
-        
         guard uidStatus == noErr else {
             Logger.error("Failed to get tap UID", metadata: ["status": "\(uidStatus)"])
             return false
         }
         
-        // CRITICAL: Use the proper tap list format as per sudara's gist and PRD
-        // The tap list is an array of dictionaries with drift compensation
-        // kAudioSubTapDriftCompensationKey: true handles clock drift at HAL level
+        // kAudioSubTapDriftCompensationKey handles clock drift at HAL level
         let uid = UUID().uuidString
         let tapUIDString = tapUIDCF as String
         
@@ -302,58 +263,8 @@ final class AudioEngine {
             kAudioAggregateDeviceIsPrivateKey: true
         ]
         
-        Logger.info("Creating aggregate device with drift compensation", metadata: [
-            "uid": uid,
-            "tapUID": tapUIDString,
-            "driftCompensation": "true"
-        ])
-        
         let status = AudioHardwareCreateAggregateDevice(aggregateDict as CFDictionary, &aggregateDeviceID)
-        
-        // Handle stale aggregate device (error 1852797029)
-        if status == 1852797029 {
-            Logger.warning("Aggregate device already exists, attempting cleanup and retry")
-            
-            // Try to find and destroy the stale device
-            var lookupAddr = AudioObjectPropertyAddress(
-                mSelector: kAudioHardwarePropertyTranslateUIDToDevice,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain
-            )
-            var staleDeviceID: AudioDeviceID = 0
-            var deviceSize = UInt32(MemoryLayout<AudioDeviceID>.size)
-            var testUID = "com.macpeq.aggregate.\(uid)" as CFString
-            
-            let lookupStatus = AudioObjectGetPropertyData(
-                AudioObjectID(kAudioObjectSystemObject),
-                &lookupAddr,
-                UInt32(MemoryLayout<CFString>.size),
-                &testUID,
-                &deviceSize,
-                &staleDeviceID
-            )
-            
-            if lookupStatus == noErr && staleDeviceID != 0 {
-                AudioHardwareDestroyAggregateDevice(staleDeviceID)
-                Logger.info("Destroyed stale aggregate device", metadata: ["id": "\(staleDeviceID)"])
-            }
-            
-            // Retry with a new unique UID
-            let newUID = UUID().uuidString
-            let retryDict: [String: Any] = [
-                kAudioAggregateDeviceNameKey: "MacPEQ",
-                kAudioAggregateDeviceUIDKey: "com.macpeq.aggregate.\(newUID)",
-                kAudioAggregateDeviceTapListKey: tapList,
-                kAudioAggregateDeviceTapAutoStartKey: false,
-                kAudioAggregateDeviceIsPrivateKey: true
-            ]
-            
-            let retryStatus = AudioHardwareCreateAggregateDevice(retryDict as CFDictionary, &aggregateDeviceID)
-            guard retryStatus == noErr else {
-                Logger.error("AudioHardwareCreateAggregateDevice retry failed", metadata: ["status": "\(retryStatus)"])
-                return false
-            }
-        } else if status != noErr {
+        guard status == noErr else {
             Logger.error("AudioHardwareCreateAggregateDevice failed", metadata: ["status": "\(status)"])
             return false
         }
@@ -363,40 +274,30 @@ final class AudioEngine {
     }
     
     private var ioProcID: AudioDeviceIOProcID?
-    private var ioProcCallbackCount = 0
     
     private func setupIOProc() -> Bool {
-        Logger.info("Setting up IOProc with C callback")
-        
-        // Create IOProc using C function pointer
         let status = AudioDeviceCreateIOProcID(
             aggregateDeviceID,
             ioProcCallback,
             Unmanaged.passUnretained(self).toOpaque(),
             &ioProcID
         )
-        
         guard status == noErr else {
             Logger.error("AudioDeviceCreateIOProcID failed", metadata: ["status": "\(status)"])
             return false
         }
-        
-        Logger.info("IOProc created successfully")
         return true
     }
     
     private func startReadingFromAggregate() {
-        Logger.info("Starting aggregate device IOProc")
-        guard let ioProcID = ioProcID else {
-            Logger.error("No IOProcID to start")
-            return
-        }
+        guard let ioProcID = ioProcID else { return }
         let status = AudioDeviceStart(aggregateDeviceID, ioProcID)
-        Logger.info("AudioDeviceStart result", metadata: ["status": "\(status)"])
+        if status != noErr {
+            Logger.error("AudioDeviceStart failed", metadata: ["status": "\(status)"])
+        }
     }
     
     private func stopReadingFromAggregate() {
-        Logger.info("Stopping aggregate device IOProc")
         guard let ioProcID = ioProcID else { return }
         AudioDeviceStop(aggregateDeviceID, ioProcID)
     }
@@ -408,58 +309,24 @@ final class AudioEngine {
         }
     }
     
-    private var firstIOProc = true
-    
     func handleIOProc(
         inputData: UnsafePointer<AudioBufferList>,
         outputData: UnsafeMutablePointer<AudioBufferList>
     ) -> OSStatus {
-        let bufferList = inputData.pointee
-        guard bufferList.mNumberBuffers > 0 else { return noErr }
+        let bufferList = UnsafeMutableAudioBufferListPointer(
+            UnsafeMutablePointer<AudioBufferList>(mutating: inputData)
+        )
+        guard bufferList.count > 0 else { return noErr }
         
-        let buffer = bufferList.mBuffers
-        guard buffer.mData != nil, buffer.mDataByteSize > 0 else { return noErr }
-        
-        // Log format details once
-        if firstIOProc {
-            firstIOProc = false
-            Logger.info("IOProc format details", metadata: [
-                "mNumberBuffers": "\(bufferList.mNumberBuffers)",
-                "mNumberChannels": "\(buffer.mNumberChannels)",
-                "mDataByteSize": "\(buffer.mDataByteSize)",
-                "expectedFrames": "\(Int(buffer.mDataByteSize) / (2 * MemoryLayout<Float>.size))"
-            ])
+        // For non-interleaved: one buffer per channel. For interleaved: one buffer with all channels.
+        // Write each buffer's data to ring buffer.
+        for buffer in bufferList {
+            guard buffer.mData != nil, buffer.mDataByteSize > 0 else { continue }
+            
+            let samples = buffer.mData!.assumingMemoryBound(to: Float.self)
+            let frameCount = Int(buffer.mDataByteSize) / (Int(buffer.mNumberChannels) * MemoryLayout<Float>.size)
+            ringBuffer?.write(samples, frameCount: frameCount)
         }
-        
-        let samples = buffer.mData!.assumingMemoryBound(to: Float.self)
-        
-        // Calculate peak level for monitoring
-        let frameCount = Int(buffer.mDataByteSize) / Int(tapFormat.mBytesPerFrame)
-        let sampleCount = frameCount * Int(tapFormat.mChannelsPerFrame)
-        
-        var peak: Float = 0
-        for i in 0..<min(sampleCount, 1024) {
-            peak = max(peak, abs(samples[i]))
-        }
-        
-        // Write to ring buffer
-        let written = ringBuffer?.write(samples, frameCount: frameCount) ?? 0
-        ioProcCallbackCount += 1
-        
-        // Log first 10 callbacks and silence detection
-        let isSilent = peak < 0.001
-        if ioProcCallbackCount <= 10 || (ioProcCallbackCount == 10 && isSilent) {
-            var meta: [String: String] = [
-                "count": "\(ioProcCallbackCount)",
-                "peak": String(format: "%.4f", peak),
-                "ringFill": String(format: "%.2f", ringBuffer?.fillRatio() ?? 0)
-            ]
-            if ioProcCallbackCount == 10 && isSilent {
-                meta["WARNING"] = "TAP_SILENT - Check System Audio Recording permission"
-            }
-            Logger.debug("IOProc", metadata: meta)
-        }
-        
         return noErr
     }
 
@@ -505,15 +372,8 @@ final class AudioEngine {
             return false
         }
         
-        // Get output device sample rate to compare with tap
-        var outputRateAddr = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyNominalSampleRate,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
         var outputRate: Float64 = 0
-        var rateSize = UInt32(MemoryLayout<Float64>.size)
-        let rateStatus = AudioObjectGetPropertyData(deviceID, &outputRateAddr, 0, nil, &rateSize, &outputRate)
+        let rateStatus = getProperty(of: deviceID, selector: kAudioDevicePropertyNominalSampleRate, value: &outputRate)
         if rateStatus == noErr {
             Logger.info("Output device sample rate", metadata: [
                 "outputRate": "\(Int(outputRate))",
@@ -583,14 +443,11 @@ final class AudioEngine {
         return true
     }
     
-    private var renderCallbackCount: Int = 0
-    
     private func handleAUHALRender(frames: UInt32, buffers: UnsafeMutablePointer<AudioBufferList>) -> OSStatus {
-        let bufferList = buffers.pointee
+        let bufferList = UnsafeMutableAudioBufferListPointer(buffers)
         let requestedFrames = Int(frames)
         
-        for i in 0..<Int(bufferList.mNumberBuffers) {
-            let buffer = bufferList.mBuffers
+        for buffer in bufferList {
             guard buffer.mData != nil else { continue }
             
             let channelCount = Int(buffer.mNumberChannels)
@@ -599,30 +456,16 @@ final class AudioEngine {
             let readFrames = ringBuffer?.read(into: dest, frameCount: requestedFrames) ?? 0
             
             if readFrames < requestedFrames {
-                // Zero remaining samples (underflow)
-                let samplesToZero = (requestedFrames - readFrames) * channelCount
-                let startIdx = readFrames * channelCount
-                for j in 0..<samplesToZero {
-                    dest[startIdx + j] = 0
-                }
+                let zeroSamples = (requestedFrames - readFrames) * channelCount
+                memset(dest.advanced(by: readFrames * channelCount), 0, zeroSamples * MemoryLayout<Float>.size)
             }
         }
         
-        renderCallbackCount += 1
         return noErr
     }
     
-    // MARK: - Start/Stop
-    
     private func startAudio() -> Bool {
-        // Start reading from aggregate device in a separate thread
         startReadingFromAggregate()
-        Logger.info("Started reading from aggregate device")
-        
-        // Wait briefly for ring buffer to fill
-        Thread.sleep(forTimeInterval: 0.1)
-        
-        // Start AUHAL
         guard let au = outputAU else { return false }
         let status = AudioOutputUnitStart(au)
         guard status == noErr else {
@@ -630,8 +473,6 @@ final class AudioEngine {
             stopReadingFromAggregate()
             return false
         }
-        Logger.info("AUHAL output started")
-        
         return true
     }
     
@@ -641,8 +482,6 @@ final class AudioEngine {
         }
         stopReadingFromAggregate()
     }
-    
-    // MARK: - Cleanup
     
     private func cleanupAll() {
         stopReadingFromAggregate()
