@@ -227,9 +227,17 @@ final class AudioEngine {
             ])
         }
         
-        // Store the tap format for later use
-        self.tapFormat = format
+        // Validate format: CP1 only supports Float32 interleaved PCM
+        guard format.mFormatID == kAudioFormatLinearPCM,
+              format.mFormatFlags & kAudioFormatFlagIsFloat != 0 else {
+            Logger.error("Unsupported tap format — expected Float32 PCM", metadata: [
+                "formatID": "\(format.mFormatID)",
+                "flags": "\(format.mFormatFlags)"
+            ])
+            return false
+        }
         
+        self.tapFormat = format
         Logger.info("Tap created", metadata: ["id": "\(tapID)"])
         return true
     }
@@ -377,9 +385,12 @@ final class AudioEngine {
         if rateStatus == noErr {
             Logger.info("Output device sample rate", metadata: [
                 "outputRate": "\(Int(outputRate))",
-                "tapRate": "\(Int(tapFormat.mSampleRate))",
-                "match": "\(Int(outputRate) == Int(tapFormat.mSampleRate))"
+                "tapRate": "\(Int(tapFormat.mSampleRate))"
             ])
+            if Int(outputRate) != Int(tapFormat.mSampleRate) {
+                Logger.error("Sample rate mismatch — CP1 does not support conversion")
+                return false
+            }
         }
         
         // Enable output, disable input
