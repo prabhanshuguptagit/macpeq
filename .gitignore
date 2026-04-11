@@ -5,4 +5,5 @@ DerivedData/
 .DS_Store
 .last_codesign_hash
 MacPEQ.app/
-
+*.log
+/tmp/macpeq.log

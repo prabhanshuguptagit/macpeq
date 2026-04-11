@@ -5,8 +5,7 @@ let package = Package(
     name: "MacPEQ",
     platforms: [.macOS(.v14)],
     products: [
-        .executable(name: "MacPEQ", targets: ["MacPEQ"]),
-        .executable(name: "sinetest", targets: ["sinetest"])
+        .executable(name: "MacPEQ", targets: ["MacPEQ"])
     ],
     dependencies: [
         .package(url: "https://github.com/michaeltyson/TPCircularBuffer", from: "1.6.2"),
@@ -15,18 +14,6 @@ let package = Package(
         .executableTarget(
             name: "MacPEQ",
             dependencies: ["TPCircularBuffer"],
-            swiftSettings: [
-                .unsafeFlags(["-suppress-warnings"])
-            ],
-            linkerSettings: [
-                .linkedFramework("CoreAudio"),
-                .linkedFramework("AudioToolbox"),
-                .linkedFramework("AVFoundation"),
-            ]
-        ),
-        .executableTarget(
-            name: "sinetest",
-            dependencies: [],
             swiftSettings: [
                 .unsafeFlags(["-suppress-warnings"])
             ],

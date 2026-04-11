@@ -408,11 +408,6 @@ final class AudioEngine {
         }
     }
     
-    // Test mode: generate sine wave instead of using tap data
-    private var testModeSineWave = false
-    private var sinePhase: Float = 0
-    private let sineFreq: Float = 1000.0
-    
     private var firstIOProc = true
     
     func handleIOProc(
@@ -436,92 +431,33 @@ final class AudioEngine {
             ])
         }
         
-        let bytesPerSample = MemoryLayout<Float>.size
-        let sampleCount = Int(buffer.mDataByteSize) / bytesPerSample
+        let samples = buffer.mData!.assumingMemoryBound(to: Float.self)
         
-        if testModeSineWave {
-            // Generate sine wave directly (bypass tap for testing)
-            var localSamples = [Float](repeating: 0, count: sampleCount)
-            for i in 0..<sampleCount/2 {
-                let sample = sin(sinePhase) * 0.3 // 30% volume
-                sinePhase += 2 * Float.pi * sineFreq / 48000.0
-                if sinePhase > 2 * Float.pi { sinePhase -= 2 * Float.pi }
-                localSamples[i*2] = sample     // left
-                localSamples[i*2+1] = sample   // right
+        // Calculate peak level for monitoring
+        let frameCount = Int(buffer.mDataByteSize) / Int(tapFormat.mBytesPerFrame)
+        let sampleCount = frameCount * Int(tapFormat.mChannelsPerFrame)
+        
+        var peak: Float = 0
+        for i in 0..<min(sampleCount, 1024) {
+            peak = max(peak, abs(samples[i]))
+        }
+        
+        // Write to ring buffer
+        let written = ringBuffer?.write(samples, frameCount: frameCount) ?? 0
+        ioProcCallbackCount += 1
+        
+        // Log first 10 callbacks and silence detection
+        let isSilent = peak < 0.001
+        if ioProcCallbackCount <= 10 || (ioProcCallbackCount == 10 && isSilent) {
+            var meta: [String: String] = [
+                "count": "\(ioProcCallbackCount)",
+                "peak": String(format: "%.4f", peak),
+                "ringFill": String(format: "%.2f", ringBuffer?.fillRatio() ?? 0)
+            ]
+            if ioProcCallbackCount == 10 && isSilent {
+                meta["WARNING"] = "TAP_SILENT - Check System Audio Recording permission"
             }
-            localSamples.withUnsafeBufferPointer { ptr in
-                let frameCount = sampleCount / 2  // stereo interleaved
-                ringBuffer?.write(ptr.baseAddress!, frameCount: frameCount)
-            }
-            
-            ioProcCallbackCount += 1
-            if ioProcCallbackCount <= 5 {
-                Logger.debug("IOProc TEST MODE (sine)", metadata: [
-                    "count": "\(ioProcCallbackCount)",
-                    "samples": "\(sampleCount)",
-                    "ringFill": String(format: "%.2f", ringBuffer?.fillRatio() ?? 0)
-                ])
-            }
-        } else {
-            // Normal tap data passthrough
-            let samples = buffer.mData!.assumingMemoryBound(to: Float.self)
-            
-            // Calculate peak level for monitoring
-            let frameCount = Int(buffer.mDataByteSize) / Int(tapFormat.mBytesPerFrame)
-            let sampleCount = frameCount * Int(tapFormat.mChannelsPerFrame)
-            
-            var peak: Float = 0
-            var dcOffset: Float = 0
-            var sampleSum: Float = 0
-            for i in 0..<min(sampleCount, 1024) {
-                peak = max(peak, abs(samples[i]))
-                dcOffset += samples[i]
-                sampleSum += samples[i]
-            }
-            dcOffset /= Float(min(sampleCount, 1024))
-            
-            // Detect stuck IOProc - same sum means same data
-            let sumDiff = abs(sampleSum - lastIOSum)
-            lastIOSum = sampleSum
-            if sumDiff < 0.0001 && peak > 0.001 {
-                stuckIOCount += 1
-            } else {
-                stuckIOCount = 0
-            }
-            
-            // Write to ring buffer (using frame count)
-            let written = ringBuffer?.write(samples, frameCount: frameCount) ?? 0
-            
-            // Increment callback count
-            ioProcCallbackCount += 1
-            
-            // Detect silence - warn if first 10 callbacks are all silent
-            let isSilent = peak < 0.001
-            
-            // Log first 10 and occasionally, or if write failed, or if silence detected
-            if ioProcCallbackCount <= 10 || ioProcCallbackCount % 500 == 0 || written != sampleCount || (ioProcCallbackCount == 10 && isSilent) {
-                // Debug: print first 4 samples
-                let s0 = samples[0]
-                let s1 = samples[1]
-                let s2 = samples[2]
-                let s3 = samples[3]
-                var meta: [String: String] = [
-                    "count": "\(ioProcCallbackCount)",
-                    "samples": "\(sampleCount)",
-                    "written": "\(written)",
-                    "peak": String(format: "%.4f", peak),
-                    "s0-1": String(format: "%.4f,%.4f", s0, s1),
-                    "ringFill": String(format: "%.2f", ringBuffer?.fillRatio() ?? 0),
-                    "stuckIO": "\(stuckIOCount)"
-                ]
-                if ioProcCallbackCount == 10 && isSilent {
-                    meta["WARNING"] = "TAP_SILENT"
-                }
-                if stuckIOCount > 5 {
-                    meta["STUCK_IO"] = "YES"
-                }
-                Logger.debug("IOProc callback", metadata: meta)
-            }
+            Logger.debug("IOProc", metadata: meta)
         }
         
         return noErr
@@ -648,29 +584,11 @@ final class AudioEngine {
     }
     
     private var renderCallbackCount: Int = 0
-    private var lastRenderPeak: Float = -1
-    private var lastRenderHash: UInt64 = 0
-    private var frozenCounter: Int = 0
-    
-    private var lastWrittenSample: Float = 0
-    
-    // Detailed diagnostics for frozen audio investigation
-    private var ioProcSampleSum: Float = 0
-    private var auHalSampleSum: Float = 0
-    private var lastIOSum: Float = -1
-    private var lastAUHSum: Float = -1
-    private var stuckIOCount: Int = 0
-    private var stuckAUHCount: Int = 0
     
     private func handleAUHALRender(frames: UInt32, buffers: UnsafeMutablePointer<AudioBufferList>) -> OSStatus {
         let bufferList = buffers.pointee
-        
-        var totalPeak: Float = 0
-        var totalReadFrames: Int = 0
         let requestedFrames = Int(frames)
         
-        // Read frames from ring buffer (handles interleaved/non-interleaved via format)
-        // For now assume interleaved stereo which matches our tap format
         for i in 0..<Int(bufferList.mNumberBuffers) {
             let buffer = bufferList.mBuffers
             guard buffer.mData != nil else { continue }
@@ -678,70 +596,19 @@ final class AudioEngine {
             let channelCount = Int(buffer.mNumberChannels)
             let dest = buffer.mData!.assumingMemoryBound(to: Float.self)
             
-            // Read frames from ring buffer
-            // For interleaved data, each frame has all channels
             let readFrames = ringBuffer?.read(into: dest, frameCount: requestedFrames) ?? 0
-            totalReadFrames += readFrames
-            let readSamples = readFrames * channelCount
-            
-            // Calculate peak and sum for logging
-            let readCount = readFrames * channelCount
-            var localPeak: Float = 0
-            var sampleSum: Float = 0
-            for j in 0..<readCount {
-                let sample = dest[j]
-                localPeak = max(localPeak, abs(sample))
-                totalPeak = max(totalPeak, abs(sample))
-                sampleSum += sample
-            }
-            
-            // Track if AUHAL is getting stuck (same sum repeatedly)
-            let sumDiff = abs(sampleSum - lastAUHSum)
-            if sumDiff < 0.0001 && totalPeak > 0.001 {
-                stuckAUHCount += 1
-            } else {
-                stuckAUHCount = 0
-                lastAUHSum = sampleSum
-            }
             
             if readFrames < requestedFrames {
                 // Zero remaining samples (underflow)
                 let samplesToZero = (requestedFrames - readFrames) * channelCount
-                let startIdx = readCount
+                let startIdx = readFrames * channelCount
                 for j in 0..<samplesToZero {
                     dest[startIdx + j] = 0
                 }
             }
         }
         
-        totalReadFrames = totalReadFrames / Int(bufferList.mNumberBuffers > 0 ? bufferList.mNumberBuffers : 1)
-        
-        // Log first 10 and occasionally
         renderCallbackCount += 1
-        let fillRatio = ringBuffer?.fillRatio() ?? 0
-        let underflow = totalReadFrames < requestedFrames
-        
-        // Detect frozen audio - check if peak is identical to previous
-        let isFrozen = abs(totalPeak - lastRenderPeak) < 0.0001 && totalPeak > 0.01
-        lastRenderPeak = totalPeak
-        
-        if renderCallbackCount <= 10 || renderCallbackCount % 100 == 0 || underflow || totalPeak > 1.0 || stuckAUHCount > 5 {
-            var meta: [String: String] = [
-                "callback": "\(renderCallbackCount)",
-                "frames": "\(frames)",
-                "readFrames": "\(totalReadFrames)/\(requestedFrames)",
-                "peak": String(format: "%.4f", totalPeak),
-                "ringFill": String(format: "%.2f", fillRatio),
-                "underflow": "\(underflow)",
-                "haveData": "\(totalReadFrames > 0)",
-                "stuckAUH": "\(stuckAUHCount)"
-            ]
-            if stuckAUHCount > 5 {
-                meta["STUCK_AUH"] = "YES"
-            }
-            Logger.debug("AUHAL render", metadata: meta)
-        }
-        
         return noErr
     }
     
