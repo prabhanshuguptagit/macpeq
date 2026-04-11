@@ -1,8 +1,9 @@
 import Foundation
 
-// MacPEQ - CP2: Single Biquad Filter
+// MacPEQ - CP3: Device Switching
 // Config: +6dB peak at 1kHz, Q=1.0
 // Usage: swift run MacPEQ (or open MacPEQ.app)
+// Switch output devices while playing - audio should resume within ~300ms
 // Press Ctrl-C to stop
 
 fileprivate var gEngine: Any?
@@ -20,9 +21,10 @@ if #available(macOS 14.2, *) {
     
     var engine: AudioEngine?
     
-    Logger.info("MacPEQ starting - CP2: Single Biquad Filter")
+    Logger.info("MacPEQ starting - CP3: Device Switching")
     
     engine = AudioEngine()
+    AudioEngine.shared = engine  // For device change callbacks
     gEngine = engine
     
     if engine?.start() ?? false {

@@ -791,8 +791,8 @@ CP1 (passthrough) ─── must pass ──→ CP2 (device switching) ───
 | CP | Verification Method |
 |---|---|
 | 1 | Manual: play audio for 10+ minutes, confirm no doubling/echo/latency creep. Console logs confirm callbacks firing. Ring buffer fill level stable. |
-| 2 | Manual: switch output devices while playing. Audio resumes <300ms, no crash. Test at least 3 different device types. |
-| 3 | Manual: play pink noise, confirm audible 1kHz boost. Toggle filter, confirm difference. |
+| 2 | Manual: play pink noise, confirm audible 1kHz boost. Toggle filter, confirm difference. |
+| 3 | Manual: switch output devices while playing. Audio resumes <300ms, no crash. Test at least 3 different device types. |
 | 4 | **Automated unit tests** — impulse→FFT→magnitude comparison ±0.5dB, plus edge-case tests (0dB passthrough, extreme Q/gain, disabled bands). All must pass. |
 | 5 | Visual: curve shape matches CP4 test expectations. |
 | 6 | Manual: drag handle, hear change in real time. No glitch or dropout. |
