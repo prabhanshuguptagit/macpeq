@@ -58,7 +58,7 @@ final class AudioEngine {
     private var ringBuffer: RingBuffer?
     private var isRunning = false
     private var tapFormat = AudioStreamBasicDescription()
-    private let ringBufferFrames: Int32 = 16384
+    private let ringBufferFrames: Int32 = 32768
     
     // CP2: Single biquad filter per channel
     private var leftFilter: BiquadFilter?
@@ -70,6 +70,8 @@ final class AudioEngine {
     private let stateQueue = DispatchQueue(label: "com.macpeq.audioEngine", qos: .userInitiated)
     private var deviceChangeListener: AudioObjectPropertyListenerProc?
     private var pendingRebuild = false
+    
+
     
     private func getProperty<T>(
         of objectID: AudioObjectID,
@@ -797,9 +799,27 @@ final class AudioEngine {
         return true
     }
     
+    // Track consecutive render callbacks for logging
+    private var renderCallbackCount = 0
+    private var lastRenderLog: Date = Date.distantPast
+    
     private func handleAUHALRender(frames: UInt32, buffers: UnsafeMutablePointer<AudioBufferList>) -> OSStatus {
         let bufferList = UnsafeMutableAudioBufferListPointer(buffers)
         let requestedFrames = Int(frames)
+        
+        renderCallbackCount += 1
+        
+
+        
+        // Log every 100th render callback to see the buffer size patterns
+        let now = Date()
+        if renderCallbackCount % 100 == 0 && now.timeIntervalSince(lastRenderLog) > 1.0 {
+            Logger.info("AUHAL render callback", metadata: [
+                "requestedFrames": "\(requestedFrames)",
+                "callbackCount": "\(renderCallbackCount)"
+            ])
+            lastRenderLog = now
+        }
         
         // CP2: Single biquad filter applied per-channel after reading from ring buffer
         // Handle both non-interleaved (separate buffer per channel) and interleaved (single buffer)
@@ -813,10 +833,11 @@ final class AudioEngine {
             // Read from ring buffer into output buffer
             let readFrames = ringBuffer?.read(into: dest, frameCount: requestedFrames) ?? 0
             
-            // Zero-fill any underrun
+            // Handle underrun: output silence (cleaner than sample repetition)
             if readFrames < requestedFrames {
-                let zeroSamples = (requestedFrames - readFrames) * channelCount
-                memset(dest.advanced(by: readFrames * channelCount), 0, zeroSamples * MemoryLayout<Float>.size)
+                let zeroStart = readFrames * channelCount
+                let zeroCount = (requestedFrames - readFrames) * channelCount
+                memset(dest.advanced(by: zeroStart), 0, zeroCount * MemoryLayout<Float>.size)
             }
             
             // CP2: Apply single biquad filter per channel (if initialized, enabled, and we have data)
@@ -850,6 +871,7 @@ final class AudioEngine {
     
     private func startAudio() -> Bool {
         startReadingFromAggregate()
+        
         guard let au = outputAU else { return false }
         let status = AudioOutputUnitStart(au)
         guard status == noErr else {
@@ -857,6 +879,12 @@ final class AudioEngine {
             stopReadingFromAggregate()
             return false
         }
+        
+        let fillLevel = ringBuffer?.fillLevel ?? 0
+        Logger.info("Audio started", metadata: [
+            "ringBufferFill": "\(fillLevel)",
+            "ratio": "\(String(format: "%.2f", Float(fillLevel) / Float(ringBufferFrames)))"
+        ])
         return true
     }
     

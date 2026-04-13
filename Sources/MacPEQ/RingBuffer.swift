@@ -66,4 +66,11 @@ final class RingBuffer {
             TPCircularBufferConsume(&circularBuffer, availableBytes)
         }
     }
+    
+    /// Returns the number of frames currently available to read
+    var fillLevel: Int32 {
+        var availableBytes: UInt32 = 0
+        _ = TPCircularBufferTail(&circularBuffer, &availableBytes)
+        return Int32(availableBytes) / Int32(bytesPerFrame)
+    }
 }
