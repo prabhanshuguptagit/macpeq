@@ -60,6 +60,14 @@ final class AudioEngine {
     private var tapFormat = AudioStreamBasicDescription()
     private let ringBufferFrames: Int32 = 32768
     
+    /// Number of IOProc callbacks to discard after a pipeline rebuild.
+    /// CoreAudio's internal graph takes a few cycles to stabilize after
+    /// creating a new aggregate device; the first callbacks can deliver
+    /// partial or discontinuous audio that causes audible glitches.
+    /// Accessed from the IOProc (real-time) thread — use atomic semantics.
+    private let ioProcSettleCallbacks = 4
+    private var ioProcSettleCount: Int32 = 0
+    
     // CP3: Pre-muted taps on all output devices.
     // Muted taps are created on every output device at startup so that when the system
     // switches default device, the new device is already muted — eliminating the "blip"
@@ -82,6 +90,11 @@ final class AudioEngine {
     private let stateQueue = DispatchQueue(label: "com.macpeq.audioEngine", qos: .userInitiated)
     private var deviceChangeListener: AudioObjectPropertyListenerProc?
     private var pendingRebuild = false
+    
+    // Sample rate change listener — detects when the user changes the rate
+    // in Audio MIDI Setup (or similar) on the current output device.
+    private var sampleRateListener: AudioObjectPropertyListenerProc?
+    private var sampleRateListenerDeviceID: AudioDeviceID = 0
     
 
     
@@ -144,6 +157,7 @@ final class AudioEngine {
             return false
         }
         currentOutputDeviceID = defaultDeviceID
+        registerSampleRateListener(for: defaultDeviceID)
         Logger.info("Default output device", metadata: ["id": "\(defaultDeviceID)"])
         
         // Register device change listener (first time only)
@@ -194,10 +208,8 @@ final class AudioEngine {
         }
         
         // Re-read tap format after aggregate creation — the aggregate forces the tap
-        // onto the device clock, so the rate may have updated. Then correct any
-        // remaining stale rate against the device's nominal rate.
+        // onto the device clock, so the rate may have updated.
         rereadTapFormat()
-        correctTapSampleRate(for: defaultDeviceID)
         
         // 5. Create ring buffer (using actual tap format)
         ringBuffer = RingBuffer(
@@ -252,6 +264,7 @@ final class AudioEngine {
     private func performStop() {
         Logger.info("Stopping AudioEngine (state was: \(state))")
         state = .tearingDown
+        unregisterSampleRateListener()
         stopAudio()
         cleanupAll()
         state = .idle
@@ -311,6 +324,52 @@ final class AudioEngine {
         
         deviceChangeListener = nil
         Logger.info("Unregistered default output device listener")
+    }
+    
+    // MARK: - Sample Rate Change Handling
+    
+    private func registerSampleRateListener(for deviceID: AudioDeviceID) {
+        // Unregister from previous device first
+        unregisterSampleRateListener()
+        
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let listener: AudioObjectPropertyListenerProc = { _, _, _, _ in
+            AudioEngine.shared?.handleSampleRateChange()
+            return noErr
+        }
+        sampleRateListener = listener
+        sampleRateListenerDeviceID = deviceID
+        AudioObjectAddPropertyListener(deviceID, &address, listener, nil)
+        Logger.info("Registered sample rate listener", metadata: ["deviceID": "\(deviceID)"])
+    }
+    
+    private func unregisterSampleRateListener() {
+        guard let listener = sampleRateListener, sampleRateListenerDeviceID != 0 else { return }
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        AudioObjectRemovePropertyListener(sampleRateListenerDeviceID, &address, listener, nil)
+        sampleRateListener = nil
+        sampleRateListenerDeviceID = 0
+        Logger.info("Unregistered sample rate listener")
+    }
+    
+    /// Called when the nominal sample rate changes on the current output device.
+    /// Forces a full pipeline rebuild by zeroing currentOutputDeviceID so
+    /// rebuildForNewDevice() doesn't short-circuit on same-device check.
+    private func handleSampleRateChange() {
+        stateQueue.async { [weak self] in
+            guard let self = self, self.state == .running else { return }
+            Logger.info("Sample rate changed — forcing pipeline rebuild")
+            self.currentOutputDeviceID = 0  // force rebuildForNewDevice to not short-circuit
+            self.handleDeviceChange()       // reuse debounce logic
+        }
     }
     
     /// Called when default output device changes.
@@ -388,9 +447,22 @@ final class AudioEngine {
         
         Logger.info("New default device", metadata: ["id": "\(newDeviceID)"])
         currentOutputDeviceID = newDeviceID
+        registerSampleRateListener(for: newDeviceID)
         
-        // Find pre-existing tap for this device
-        if deviceTaps[newDeviceID] == nil {
+        // Find pre-existing tap for this device.
+        // If we already have a tap but the pipeline is being rebuilt for the same device
+        // (e.g. sample rate change), destroy and recreate it so the new aggregate device
+        // picks up the updated format.
+        if let existingTap = deviceTaps[newDeviceID], existingTap.tapID == tapID {
+            // Same tap we were just using — stale after a rate change. Recreate it.
+            Logger.info("Recreating tap for same device (sample rate change)", metadata: [
+                "deviceID": "\(newDeviceID)",
+                "oldTapID": "\(existingTap.tapID)"
+            ])
+            AudioHardwareDestroyProcessTap(existingTap.tapID)
+            deviceTaps.removeValue(forKey: newDeviceID)
+            createTapForDevice(newDeviceID)
+        } else if deviceTaps[newDeviceID] == nil {
             Logger.warning("No pre-created tap for device \(newDeviceID) — creating one now")
             createTapForDevice(newDeviceID)
         }
@@ -431,13 +503,10 @@ final class AudioEngine {
             return
         }
         
-        // Re-read tap format after aggregate creation, then correct the sample rate.
-        // Pre-created taps lock to the device clock at creation time — if the device
-        // was inactive then, the tap may still report the old rate (e.g. 44100 for a
-        // 48000 UMC). The aggregate doesn't always force an update. We read the
-        // device's nominal rate directly and use that as the authoritative rate.
+        // Re-read tap format after aggregate creation. This may update the channel
+        // count or rate. The rate is informational — createAUHALOutput uses the output
+        // device's nominal rate directly. Channel count matters for the ring buffer.
         rereadTapFormat()
-        correctTapSampleRate(for: newDeviceID)
         
         // Recreate ring buffer (channel count / sample rate may have changed)
         ringBuffer = RingBuffer(
@@ -557,23 +626,6 @@ final class AudioEngine {
         
         let canMute = ownProcessObject != nil
         tapDesc.muteBehavior = canMute ? .muted : .unmuted
-
-        // DIAG: If canMute is false the tap won't silence the device — this is a
-        // likely cause of a blip on switch. PID translation can fail if the process
-        // object hasn't been registered with HAL yet (rare but possible at startup).
-        if !canMute {
-            Logger.warning("canMute=false — tap will NOT silence device, blip likely", metadata: [
-                "deviceID": "\(deviceID)",
-                "deviceUID": deviceUID,
-                "ownPID": "\(ownPID)"
-            ])
-        } else {
-            Logger.info("canMute=true", metadata: [
-                "deviceID": "\(deviceID)",
-                "deviceUID": deviceUID,
-                "processObject": "\(ownProcessObject!)"
-            ])
-        }
         
         var newTapID: AudioObjectID = 0
         let status = AudioHardwareCreateProcessTap(tapDesc, &newTapID)
@@ -591,8 +643,7 @@ final class AudioEngine {
         Logger.info("Pre-muted tap created", metadata: [
             "deviceID": "\(deviceID)",
             "deviceUID": deviceUID,
-            "tapID": "\(newTapID)",
-            "muted": "\(canMute)"
+            "tapID": "\(newTapID)"
         ])
         return true
     }
@@ -844,6 +895,18 @@ final class AudioEngine {
         inputData: UnsafePointer<AudioBufferList>,
         outputData: UnsafeMutablePointer<AudioBufferList>
     ) -> OSStatus {
+        // Discard the first few callbacks after a rebuild while CoreAudio stabilizes.
+        // Atomic decrement: if count > 0, skip this callback.
+        let remaining = OSAtomicDecrement32(&ioProcSettleCount)
+        if remaining >= 0 {
+            // Still settling — don't feed stale/partial frames into ring buffer
+            return noErr
+        }
+        // Clamp at -1 to avoid underflow on long-running sessions
+        if remaining < -1 {
+            OSAtomicCompareAndSwap32(remaining, -1, &ioProcSettleCount)
+        }
+        
         let bufferList = UnsafeMutableAudioBufferListPointer(
             UnsafeMutablePointer<AudioBufferList>(mutating: inputData)
         )
@@ -866,10 +929,10 @@ final class AudioEngine {
     /// Hardcoded: +6dB peak at 1kHz, Q=1.0
     private func initFilters(sampleRate: Float) {
         leftFilter = BiquadMath.makeFilter(
-            type: .peak, frequency: 1000.0, gain: 6.0, q: 1.0, sampleRate: sampleRate
+            type: .peak, frequency: 4000.0, gain: 10.0, q: 1.0, sampleRate: sampleRate
         )
         rightFilter = BiquadMath.makeFilter(
-            type: .peak, frequency: 1000.0, gain: 6.0, q: 1.0, sampleRate: sampleRate
+            type: .peak, frequency: 2000.0, gain: 10.0, q: 1.0, sampleRate: sampleRate
         )
         
         #if DEBUG
@@ -921,45 +984,14 @@ final class AudioEngine {
         }
     }
     
-    /// Override tapFormat.mSampleRate with the device's actual nominal rate.
-    ///
-    /// Pre-created taps lock to the HAL clock of whichever device was active at
-    /// creation time. Even after aggregate creation, kAudioTapPropertyFormat may
-    /// still report the old rate. The device nominal rate is always authoritative —
-    /// that's what the IOProc will actually deliver after the aggregate binds the tap.
-    private func correctTapSampleRate(for deviceID: AudioDeviceID) {
-        var deviceRate: Float64 = 0
-        let status = getProperty(of: deviceID, selector: kAudioDevicePropertyNominalSampleRate, value: &deviceRate)
-        guard status == noErr, deviceRate > 0 else {
-            Logger.warning("correctTapSampleRate: could not read device nominal rate", metadata: [
-                "deviceID": "\(deviceID)", "status": "\(status)"
-            ])
-            return
-        }
-        
-        let tapRate = tapFormat.mSampleRate
-        if Int(tapRate) != Int(deviceRate) {
-            Logger.info("Correcting stale tap sample rate to device nominal rate", metadata: [
-                "staleRate": "\(Int(tapRate))",
-                "deviceRate": "\(Int(deviceRate))",
-                "deviceID": "\(deviceID)"
-            ])
-            tapFormat.mSampleRate = deviceRate
-            // mBytesPerFrame and mBytesPerPacket don't depend on sample rate for PCM,
-            // so no other ASBD fields need updating.
-        } else {
-            Logger.info("Tap sample rate matches device nominal rate", metadata: [
-                "rate": "\(Int(deviceRate))"
-            ])
-        }
-    }
-
     private func createAUHALOutput(defaultDeviceID: AudioDeviceID) -> Bool {
         Logger.info("Creating AUHAL output unit")
         
         // Two rates matter here:
         // 1. tapFormat.mSampleRate — what the tap actually delivers via IOProc into
         //    the ring buffer. This is what we feed AUHAL in the render callback.
+        //    May be "stale" (e.g. 44100 from UMC when MacBook is now active), but
+        //    that IS the actual sample rate of the data in the ring buffer.
         // 2. Device nominal rate — what the output hardware runs at.
         //
         // We tell AUHAL: "I'm feeding you data at tapRate." AUHAL knows the output
@@ -978,18 +1010,6 @@ final class AudioEngine {
         ])
         if rateStatus == noErr && Int(deviceRate) != Int(tapRate) {
             Logger.info("Tap and device rates differ — AUHAL will handle SRC")
-        }
-
-        // DIAG: Verify rereadTapFormat() gave us the real device rate.
-        // If these differ after aggregate creation it means the tap format wasn't
-        // updated correctly — the ring buffer will contain data at a different rate
-        // than we're telling AUHAL, causing pitch shift / stutter on this device.
-        if rateStatus == noErr && Int(tapRate) != Int(deviceRate) {
-            Logger.warning("DIAG: tapRate != deviceRate after aggregate — possible SRC issue", metadata: [
-                "tapRate": "\(Int(tapRate))",
-                "deviceRate": "\(Int(deviceRate))",
-                "deviceID": "\(defaultDeviceID)"
-            ])
         }
         
         // Initialize filters at the tap's rate (data rate we process)
@@ -1106,14 +1126,14 @@ final class AudioEngine {
         renderCallbackCount &+= 1
         
         // Periodic logging — use CFAbsoluteTimeGetCurrent (no heap allocation)
-        // instead of Date(). Only check time every 512th callback to minimize overhead.
-        if renderCallbackCount & 511 == 0 {
+        // instead of Date(). Only check time every 500th callback to minimize
+        // even the CFAbsoluteTime call overhead.
+        if renderCallbackCount & 511 == 0 {  // every 512 callbacks (power-of-2 mask)
             let now = CFAbsoluteTimeGetCurrent()
             if now - lastRenderLogTime > 2.0 {
                 Logger.info("AUHAL render", metadata: [
                     "frames": "\(requestedFrames)",
-                    "count": "\(renderCallbackCount)",
-                    "fillLevel": "\(ringBuffer?.fillLevel ?? -1)"
+                    "count": "\(renderCallbackCount)"
                 ])
                 lastRenderLogTime = now
             }
@@ -1178,6 +1198,11 @@ final class AudioEngine {
     }
     
     private func startAudio() -> Bool {
+        // Arm the settle counter — the first few IOProc callbacks will be
+        // discarded so CoreAudio's graph can stabilize before we feed the
+        // ring buffer. This prevents glitches on device/rate switches.
+        OSAtomicCompareAndSwap32(ioProcSettleCount, Int32(ioProcSettleCallbacks), &ioProcSettleCount)
+        
         // Start IOProc first — this fills the ring buffer from the tap
         startReadingFromAggregate()
         
@@ -1194,16 +1219,9 @@ final class AudioEngine {
         while (ringBuffer?.fillLevel ?? 0) < targetFrames {
             let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
             if elapsed > Double(maxWaitMs) {
-                // DIAG: Hitting this on UMC→MacBook means the IOProc isn't filling the
-                // ring buffer — likely the aggregate isn't delivering callbacks yet,
-                // possibly because tapFormat.mSampleRate is wrong (stale pre-aggregate
-                // rate) and the IOProc frame size math is off, or the aggregate itself
-                // isn't running. Check "Aggregate device created" and "IOProc" logs
-                // immediately above this for clues.
-                Logger.warning("DIAG: Ring buffer pre-fill timeout — IOProc may not be delivering data", metadata: [
+                Logger.warning("Ring buffer pre-fill timeout", metadata: [
                     "fillLevel": "\(ringBuffer?.fillLevel ?? 0)",
                     "targetFrames": "\(targetFrames)",
-                    "tapRate": "\(Int(tapFormat.mSampleRate))",
                     "elapsedMs": "\(Int(elapsed))"
                 ])
                 break
@@ -1213,12 +1231,10 @@ final class AudioEngine {
         
         let fillLevel = ringBuffer?.fillLevel ?? 0
         let waitMs = Int((CFAbsoluteTimeGetCurrent() - startTime) * 1000)
-        let timedOut = fillLevel < targetFrames
-        Logger.info("Ring buffer pre-fill \(timedOut ? "TIMED OUT" : "OK")", metadata: [
+        Logger.info("Ring buffer pre-filled", metadata: [
             "fillLevel": "\(fillLevel)",
             "targetFrames": "\(targetFrames)",
-            "waitMs": "\(waitMs)",
-            "timedOut": "\(timedOut)"
+            "waitMs": "\(waitMs)"
         ])
         
         // Now start AUHAL — ring buffer has data ready
@@ -1266,6 +1282,7 @@ final class AudioEngine {
     
     deinit {
         unregisterDeviceChangeListener()
+        unregisterSampleRateListener()
         unregisterDeviceListListener()
         // Destroy all pre-muted taps
         for (_, tap) in deviceTaps {
