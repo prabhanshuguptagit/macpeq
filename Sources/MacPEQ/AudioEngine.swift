@@ -73,9 +73,6 @@ final class AudioEngine {
 
             if self.deviceChangeListener == nil { self.registerDeviceChangeListener() }
 
-            self.tapManager.activeDeviceID = defaultDeviceID
-            self.tapManager.start()
-
             guard self.buildPipeline(deviceID: defaultDeviceID) else { return }
 
             self.isRunning = true
@@ -97,8 +94,6 @@ final class AudioEngine {
             self.unregisterSampleRateListener()
             self.stopAudio()
             self.cleanupPipeline()
-            self.tapManager.stop()
-            self.tapID = 0
             self.isRunning = false
         }
         sem.wait()
@@ -116,7 +111,7 @@ final class AudioEngine {
     // MARK: - Pipeline Setup / Teardown
 
     private func buildPipeline(deviceID: AudioDeviceID) -> Bool {
-        guard let tapID = tapManager.tapID(for: deviceID) else { return false }
+        guard let tapID = tapManager.createTap(for: deviceID) else { return false }
         self.tapID = tapID
 
         guard getProperty(of: tapID, selector: kAudioTapPropertyFormat, value: &tapFormat) == noErr else { return false }
@@ -167,11 +162,6 @@ final class AudioEngine {
 
         currentOutputDeviceID = newDeviceID
         registerSampleRateListener(for: newDeviceID)
-        tapManager.activeDeviceID = newDeviceID
-
-        if newDeviceID == previousDeviceID {
-            tapManager.destroyTap(for: newDeviceID)
-        }
 
         guard buildPipeline(deviceID: newDeviceID) else {
             setDeviceMute(newDeviceID, muted: false)
@@ -249,7 +239,7 @@ final class AudioEngine {
                 self.rebuildForNewDevice()
             }
             self.debounceWorkItem = workItem
-            self.audioQueue.asyncAfter(deadline: .now() + 0.1, execute: workItem)
+            self.audioQueue.asyncAfter(deadline: .now() + 0.05, execute: workItem)
         }
     }
 
@@ -559,6 +549,7 @@ final class AudioEngine {
         cleanupIOProc()
         if let au = outputAU { AudioUnitUninitialize(au); AudioComponentInstanceDispose(au); outputAU = nil }
         cleanupAggregateDevice()
+        if tapID != 0 { tapManager.destroyTap(tapID); tapID = 0 }
         ringBuffer = nil
         if let ptr = scratchBuffer {
             ptr.deinitialize(count: scratchBufferSampleCount)
