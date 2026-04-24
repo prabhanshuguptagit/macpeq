@@ -7,3 +7,5 @@ DerivedData/
 MacPEQ.app/
 *.log
 /tmp/macpeq.log
+.clj-kondo/
+.lsp/
