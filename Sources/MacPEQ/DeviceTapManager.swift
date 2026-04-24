@@ -4,6 +4,8 @@ import Foundation
 
 /// Manages pre-muted taps on all output devices so that when the system switches
 /// default device, the new device is already muted — no raw audio blip.
+///
+/// All internal state (`taps`) is protected by a private serial queue.
 @available(macOS 14.2, *)
 final class DeviceTapManager {
     private struct DeviceTap {
@@ -12,6 +14,7 @@ final class DeviceTapManager {
         let tapID: AudioObjectID
     }
 
+    private let queue = DispatchQueue(label: "com.macpeq.tapmanager", qos: .userInitiated)
     private var taps: [AudioDeviceID: DeviceTap] = [:]
     private var deviceListListener: AudioObjectPropertyListenerProc?
 
@@ -19,48 +22,65 @@ final class DeviceTapManager {
     static weak var shared: DeviceTapManager?
 
     func start() {
-        createTapsOnAllDevices()
+        queue.sync {
+            createTapsOnAllDevices()
+        }
         registerDeviceListListener()
     }
 
     func stop() {
         unregisterDeviceListListener()
-        for (_, tap) in taps { AudioHardwareDestroyProcessTap(tap.tapID) }
-        taps.removeAll()
+        queue.sync { [weak self] in
+            guard let self = self else { return }
+            for (_, tap) in self.taps { AudioHardwareDestroyProcessTap(tap.tapID) }
+            self.taps.removeAll()
+        }
     }
 
+    /// Thread-safe synchronous accessor for tap ID.
     func tapID(for deviceID: AudioDeviceID) -> AudioObjectID? {
-        if let existing = taps[deviceID] { return existing.tapID }
-        return createTap(for: deviceID)
+        queue.sync {
+            if let existing = taps[deviceID] { return existing.tapID }
+            return createTapSync(for: deviceID)
+        }
     }
 
     func destroyTap(for deviceID: AudioDeviceID) {
-        guard let tap = taps.removeValue(forKey: deviceID) else { return }
-        AudioHardwareDestroyProcessTap(tap.tapID)
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            guard let tap = self.taps.removeValue(forKey: deviceID) else { return }
+            AudioHardwareDestroyProcessTap(tap.tapID)
+        }
     }
 
     func handleDeviceListChange() {
-        let devices = getAllOutputDevices()
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            let devices = self.getAllOutputDevices()
 
-        for (devID, devUID) in devices where taps[devID] == nil {
-            createTap(for: devID, uid: devUID)
-        }
+            for (devID, devUID) in devices where self.taps[devID] == nil {
+                self.createTapSync(for: devID, uid: devUID)
+            }
 
-        let currentDeviceIDs = Set(devices.map { $0.0 })
-        for (devID, tap) in taps where !currentDeviceIDs.contains(devID) && devID != activeDeviceID {
-            AudioHardwareDestroyProcessTap(tap.tapID)
-            taps.removeValue(forKey: devID)
+            let currentDeviceIDs = Set(devices.map { $0.0 })
+            for (devID, tap) in self.taps where !currentDeviceIDs.contains(devID) && devID != self.activeDeviceID {
+                AudioHardwareDestroyProcessTap(tap.tapID)
+                self.taps.removeValue(forKey: devID)
+            }
         }
     }
+
+    // MARK: - Private
 
     private func createTapsOnAllDevices() {
         let devices = getAllOutputDevices()
-        for (devID, devUID) in devices { createTap(for: devID, uid: devUID) }
+        for (devID, devUID) in devices { createTapSync(for: devID, uid: devUID) }
         Logger.info("Pre-muted taps created", metadata: ["count": "\(taps.count)"])
     }
 
+    /// Must be called on `queue`.
     @discardableResult
-    private func createTap(for deviceID: AudioDeviceID, uid: String? = nil) -> AudioObjectID? {
+    private func createTapSync(for deviceID: AudioDeviceID, uid: String? = nil) -> AudioObjectID? {
         if taps[deviceID] != nil { return taps[deviceID]!.tapID }
 
         let deviceUID: String

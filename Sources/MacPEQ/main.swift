@@ -1,9 +1,7 @@
 import Foundation
 
-// MacPEQ - CP3: Device Switching
-// Config: +6dB peak at 1kHz, Q=1.0
+// MacPEQ - System-Wide Parametric EQ
 // Usage: swift run MacPEQ (or open MacPEQ.app)
-// Switch output devices while playing - audio should resume within ~300ms
 // Press Ctrl-C to stop
 
 fileprivate var gEngine: Any?
@@ -13,21 +11,31 @@ func signalHandler(signal: Int32) {
     exit(0)
 }
 
+// ISO frequencies for 10-band EQ
+let defaultBands: [EQBand] = [
+    // Telephone effect: high-pass ~300Hz + low-pass ~3400Hz
+    EQBand(frequency: 300,  gain: 0, q: 0.7, type: .highPass),
+    EQBand(frequency: 3400, gain: 0, q: 0.7, type: .lowPass),
+]
+
 // Check macOS version first
 if #available(macOS 14.2, *) {
-    // Set up signal handler for clean shutdown
     signal(SIGINT, signalHandler)
     signal(SIGTERM, signalHandler)
-    
+
     var engine: AudioEngine?
-    
-    Logger.info("MacPEQ starting - CP3: Device Switching")
-    
+
+    Logger.info("MacPEQ starting")
+
     engine = AudioEngine()
-    AudioEngine.shared = engine  // For device change callbacks
+    AudioEngine.shared = engine
     gEngine = engine
-    
+
     if engine?.start() ?? false {
+        // Apply default EQ bands
+        engine?.updateEQ(bands: defaultBands)
+        Logger.info("EQ active: telephone effect (300Hz HP + 3400Hz LP)")
+
         RunLoop.main.run()
     } else {
         Logger.error("Failed to start engine")

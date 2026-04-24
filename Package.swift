@@ -11,9 +11,10 @@ let package = Package(
         .package(url: "https://github.com/michaeltyson/TPCircularBuffer", from: "1.6.2"),
     ],
     targets: [
+        .target(name: "CAtomics"),
         .executableTarget(
             name: "MacPEQ",
-            dependencies: ["TPCircularBuffer"],
+            dependencies: ["TPCircularBuffer", "CAtomics"],
             swiftSettings: [
                 .unsafeFlags(["-suppress-warnings"])
             ],

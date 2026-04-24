@@ -17,12 +17,20 @@ fileprivate func ioProcCallback(
 }
 
 /// System Tap → IOProc → RingBuffer → EQ → AUHAL Output → Default Device
-/// All state on main thread. Real-time path only touches ringBuffer + filters.
+///
+/// Lifecycle (start/stop/rebuild) runs on a dedicated serial queue.
+/// Real-time path (IOProc + AUHAL render) only touches ringBuffer + EQProcessor.
+/// EQ parameter updates are double-buffered and atomic — safe from any thread.
 @available(macOS 14.2, *)
 final class AudioEngine {
     static weak var shared: AudioEngine?
 
-    init() { DeviceTapManager.shared = tapManager }
+    /// Dedicated serial queue for all audio lifecycle operations.
+    let audioQueue = DispatchQueue(label: "com.macpeq.audio", qos: .userInitiated)
+
+    init() {
+        DeviceTapManager.shared = tapManager
+    }
 
     private(set) var isRunning = false
     private var tapID: AudioObjectID = 0
@@ -34,75 +42,92 @@ final class AudioEngine {
     private var currentOutputDeviceID: AudioDeviceID = 0
     private var ioProcID: AudioDeviceIOProcID?
 
-
+    private var scratchBuffer: UnsafeMutablePointer<Float>?
+    private var scratchFrameCapacity: Int = 0
+    private var scratchBufferSampleCount: Int = 0
 
     private let tapManager = DeviceTapManager()
-    private var leftFilter: BiquadFilter?
-    private var rightFilter: BiquadFilter?
+    private var eqProcessor: EQProcessor?
+    private var currentBands: [EQBand]?
 
     private var deviceChangeListener: AudioObjectPropertyListenerProc?
     private var debounceWorkItem: DispatchWorkItem?
     private var sampleRateListener: AudioObjectPropertyListenerProc?
     private var sampleRateListenerDeviceID: AudioDeviceID = 0
 
-    private func getProperty<T>(
-        of objectID: AudioObjectID, selector: AudioObjectPropertySelector, value: inout T
-    ) -> OSStatus {
-        var address = AudioObjectPropertyAddress(
-            mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
-        var size = UInt32(MemoryLayout<T>.size)
-        return AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &value)
-    }
+    // MARK: - Public API
 
-    private func getProperty<T, Q>(
-        of objectID: AudioObjectID, selector: AudioObjectPropertySelector,
-        qualifier: inout Q, value: inout T
-    ) -> OSStatus {
-        var address = AudioObjectPropertyAddress(
-            mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
-        var size = UInt32(MemoryLayout<T>.size)
-        return AudioObjectGetPropertyData(objectID, &address,
-            UInt32(MemoryLayout<Q>.size), &qualifier, &size, &value)
-    }
-
+    /// Start the engine. Safe to call from any thread.
     func start() -> Bool {
-        guard !isRunning else { return false }
-        Logger.info("Starting AudioEngine")
+        dispatchPrecondition(condition: .notOnQueue(audioQueue))
+        var result = false
+        let sem = DispatchSemaphore(value: 0)
+        audioQueue.async { [weak self] in
+            defer { sem.signal() }
+            guard let self = self, !self.isRunning else { return }
+            Logger.info("Starting AudioEngine")
 
-        guard let defaultDeviceID = getDefaultOutputDevice() else { return false }
-        currentOutputDeviceID = defaultDeviceID
-        registerSampleRateListener(for: defaultDeviceID)
+            guard let defaultDeviceID = self.getDefaultOutputDevice() else { return }
+            self.currentOutputDeviceID = defaultDeviceID
+            self.registerSampleRateListener(for: defaultDeviceID)
 
-        if deviceChangeListener == nil { registerDeviceChangeListener() }
+            if self.deviceChangeListener == nil { self.registerDeviceChangeListener() }
 
-        tapManager.activeDeviceID = defaultDeviceID
-        tapManager.start()
+            self.tapManager.activeDeviceID = defaultDeviceID
+            self.tapManager.start()
 
-        guard buildPipeline(deviceID: defaultDeviceID) else { return false }
+            guard self.buildPipeline(deviceID: defaultDeviceID) else { return }
 
-        isRunning = true
-        Logger.info("AudioEngine started")
-        return true
+            self.isRunning = true
+            Logger.info("AudioEngine started")
+            result = true
+        }
+        sem.wait()
+        return result
     }
 
+    /// Stop the engine. Safe to call from any thread.
     func stop() {
-        guard isRunning else { return }
-        Logger.info("Stopping AudioEngine")
-        unregisterSampleRateListener()
-        stopAudio()
-        cleanupPipeline()
-        tapManager.stop()
-        tapID = 0
-        isRunning = false
+        dispatchPrecondition(condition: .notOnQueue(audioQueue))
+        let sem = DispatchSemaphore(value: 0)
+        audioQueue.async { [weak self] in
+            defer { sem.signal() }
+            guard let self = self, self.isRunning else { return }
+            Logger.info("Stopping AudioEngine")
+            self.unregisterSampleRateListener()
+            self.stopAudio()
+            self.cleanupPipeline()
+            self.tapManager.stop()
+            self.tapID = 0
+            self.isRunning = false
+        }
+        sem.wait()
     }
+
+    /// Update EQ bands from the UI thread (or any thread). Double-buffered, lock-free.
+    func updateEQ(bands: [EQBand]) {
+        audioQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.currentBands = bands
+            self.eqProcessor?.updateBands(bands)
+        }
+    }
+
+    // MARK: - Pipeline Setup / Teardown
 
     private func buildPipeline(deviceID: AudioDeviceID) -> Bool {
         guard let tapID = tapManager.tapID(for: deviceID) else { return false }
         self.tapID = tapID
 
         guard getProperty(of: tapID, selector: kAudioTapPropertyFormat, value: &tapFormat) == noErr else { return false }
+        Logger.info("Tap format", metadata: [
+            "sampleRate": "\(tapFormat.mSampleRate)",
+            "channels": "\(tapFormat.mChannelsPerFrame)",
+            "bits": "\(tapFormat.mBitsPerChannel)",
+            "bytesPerFrame": "\(tapFormat.mBytesPerFrame)",
+            "bytesPerPacket": "\(tapFormat.mBytesPerPacket)",
+            "flags": "0x\(String(tapFormat.mFormatFlags, radix: 16))"
+        ])
         guard tapFormat.mFormatID == kAudioFormatLinearPCM,
               tapFormat.mFormatFlags & kAudioFormatFlagIsFloat != 0 else { return false }
 
@@ -110,9 +135,17 @@ final class AudioEngine {
 
         rereadTapFormat()
 
+        // Scratch buffer for render callback (single read → EQ → distribute)
+        let channels = Int(tapFormat.mChannelsPerFrame)
+        let maxFramesPerCallback = 4096  // generous upper bound
+        scratchFrameCapacity = maxFramesPerCallback
+        scratchBufferSampleCount = maxFramesPerCallback * channels
+        scratchBuffer = .allocate(capacity: scratchBufferSampleCount)
+        scratchBuffer?.initialize(repeating: 0, count: scratchBufferSampleCount)
+
         ringBuffer = RingBuffer(
             capacityFrames: ringBufferFrames,
-            channels: Int(tapFormat.mChannelsPerFrame),
+            channels: channels,
             bytesPerSample: Int(tapFormat.mBytesPerFrame / tapFormat.mChannelsPerFrame))
 
         guard setupIOProc() else { cleanupAggregateDevice(); return false }
@@ -141,10 +174,41 @@ final class AudioEngine {
         }
 
         guard buildPipeline(deviceID: newDeviceID) else {
+            setDeviceMute(newDeviceID, muted: false)
             isRunning = false; return
         }
+
+        // Pipeline is running, tap is muted — safe to unmute the device
+        setDeviceMute(newDeviceID, muted: false)
         Logger.info("Audio resumed on new device")
     }
+
+    /// Mute/unmute a device's output. Falls back to volume if mute isn't supported.
+    private func setDeviceMute(_ deviceID: AudioDeviceID, muted: Bool) {
+        var muteAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain)
+
+        if AudioObjectHasProperty(deviceID, &muteAddress) {
+            var mute: UInt32 = muted ? 1 : 0
+            AudioObjectSetPropertyData(deviceID, &muteAddress, 0, nil,
+                UInt32(MemoryLayout<UInt32>.size), &mute)
+        } else {
+            // Fallback: ramp volume to 0 / restore
+            var volAddress = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyVolumeScalar,
+                mScope: kAudioObjectPropertyScopeOutput,
+                mElement: kAudioObjectPropertyElementMain)
+            if AudioObjectHasProperty(deviceID, &volAddress) {
+                var vol: Float32 = muted ? 0.0 : 1.0
+                AudioObjectSetPropertyData(deviceID, &volAddress, 0, nil,
+                    UInt32(MemoryLayout<Float32>.size), &vol)
+            }
+        }
+    }
+
+    // MARK: - Property Listeners
 
     private func registerDeviceChangeListener() {
         var address = AudioObjectPropertyAddress(
@@ -171,7 +235,12 @@ final class AudioEngine {
     }
 
     private func handleDeviceChange() {
-        DispatchQueue.main.async { [weak self] in
+        // Mute immediately on the CoreAudio listener thread — before debounce
+        if let newDevice = getDefaultOutputDevice() {
+            setDeviceMute(newDevice, muted: true)
+        }
+
+        audioQueue.async { [weak self] in
             guard let self = self, self.isRunning else { return }
             self.debounceWorkItem?.cancel()
             let workItem = DispatchWorkItem { [weak self] in
@@ -180,7 +249,7 @@ final class AudioEngine {
                 self.rebuildForNewDevice()
             }
             self.debounceWorkItem = workItem
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: workItem)
+            self.audioQueue.asyncAfter(deadline: .now() + 0.1, execute: workItem)
         }
     }
 
@@ -211,12 +280,14 @@ final class AudioEngine {
     }
 
     private func handleSampleRateChange() {
-        DispatchQueue.main.async { [weak self] in
+        audioQueue.async { [weak self] in
             guard let self = self, self.isRunning else { return }
             self.currentOutputDeviceID = 0  // force rebuild to not short-circuit
             self.rebuildForNewDevice()
         }
     }
+
+    // MARK: - Helpers
 
     private func getDefaultOutputDevice() -> AudioDeviceID? {
         var deviceID: AudioDeviceID = 0
@@ -226,10 +297,32 @@ final class AudioEngine {
         return deviceID
     }
 
-    /// 'cmbe' — aggregate device with this UID already exists
+    private func getProperty<T>(
+        of objectID: AudioObjectID, selector: AudioObjectPropertySelector, value: inout T
+    ) -> OSStatus {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var size = UInt32(MemoryLayout<T>.size)
+        return AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &value)
+    }
+
+    private func getProperty<T, Q>(
+        of objectID: AudioObjectID, selector: AudioObjectPropertySelector,
+        qualifier: inout Q, value: inout T
+    ) -> OSStatus {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var size = UInt32(MemoryLayout<T>.size)
+        return AudioObjectGetPropertyData(objectID, &address,
+            UInt32(MemoryLayout<Q>.size), &qualifier, &size, &value)
+    }
+
+    // MARK: - Aggregate Device
+
     private let kAggregateDeviceExistsError: OSStatus = 1852797029
 
-    /// Deterministic UID based on tap UID — enables crash recovery
     private func makeAggregateUID(tapUID: String) -> String {
         return "com.macpeq.aggregate.\(tapUID)"
     }
@@ -282,18 +375,17 @@ final class AudioEngine {
         return AudioHardwareDestroyAggregateDevice(deviceID) == noErr
     }
 
-    /// Re-read tap format after aggregate creation — the aggregate forces the tap
-    /// onto the device clock, so the rate may have updated.
     private func rereadTapFormat() {
         _ = getProperty(of: tapID, selector: kAudioTapPropertyFormat, value: &tapFormat)
     }
+
+    // MARK: - IOProc
 
     private func setupIOProc() -> Bool {
         AudioDeviceCreateIOProcID(aggregateDeviceID, ioProcCallback,
             Unmanaged.passUnretained(self).toOpaque(), &ioProcID) == noErr
     }
 
-    /// IOProc callbacks to discard after a rebuild (atomic, read on RT thread)
     private let ioProcSettleCallbacks: Int32 = 4
     private var ioProcSettleCount: Int32 = 0
 
@@ -314,7 +406,6 @@ final class AudioEngine {
         }
     }
 
-    /// Called by CoreAudio on a real-time thread. Writes tap audio into the ring buffer.
     func handleIOProc(inputData: UnsafePointer<AudioBufferList>,
                       outputData: UnsafeMutablePointer<AudioBufferList>) -> OSStatus {
         if OSAtomicDecrement32(&ioProcSettleCount) >= 0 { return noErr }
@@ -325,13 +416,22 @@ final class AudioEngine {
         return noErr
     }
 
-    private func initFilters(sampleRate: Float) {
-        leftFilter = BiquadMath.makeFilter(type: .peak, frequency: 4000.0, gain: 10.0, q: 1.0, sampleRate: sampleRate)
-        rightFilter = BiquadMath.makeFilter(type: .peak, frequency: 2000.0, gain: 10.0, q: 1.0, sampleRate: sampleRate)
-    }
+    // MARK: - AUHAL Output
 
     private func createAUHALOutput(defaultDeviceID: AudioDeviceID) -> Bool {
-        initFilters(sampleRate: Float(tapFormat.mSampleRate))
+        let channels = Int(tapFormat.mChannelsPerFrame)
+        // Only EQ the first 2 channels (stereo). Extra channels pass through unmodified.
+        eqProcessor = EQProcessor(bandCount: 10, channelCount: min(channels, 2), sampleRate: Float(tapFormat.mSampleRate))
+
+        // Re-apply previous EQ bands if we have them
+        if let bands = currentBands {
+            eqProcessor?.updateBands(bands)
+        }
+        Logger.info("AUHAL format set", metadata: [
+            "sampleRate": "\(tapFormat.mSampleRate)",
+            "channels": "\(tapFormat.mChannelsPerFrame)",
+            "bytesPerFrame": "\(tapFormat.mBytesPerFrame)"
+        ])
 
         var compDesc = AudioComponentDescription(
             componentType: kAudioUnitType_Output, componentSubType: kAudioUnitSubType_HALOutput,
@@ -371,51 +471,72 @@ final class AudioEngine {
         let bufferList = UnsafeMutableAudioBufferListPointer(buffers)
         let requestedFrames = Int(frames)
 
-        guard let rb = ringBuffer else {
-            for buffer in bufferList { if let data = buffer.mData { memset(data, 0, Int(buffer.mDataByteSize)) } }
+        guard let rb = ringBuffer, let scratch = scratchBuffer else {
+            for buffer in bufferList {
+                if let data = buffer.mData { memset(data, 0, Int(buffer.mDataByteSize)) }
+            }
             return noErr
         }
 
-        var bufferIndex = 0
-        for buffer in bufferList {
-            guard let data = buffer.mData else { bufferIndex += 1; continue }
-            let channelCount = Int(buffer.mNumberChannels)
-            let dest = data.assumingMemoryBound(to: Float.self)
-            let readFrames = rb.read(into: dest, frameCount: requestedFrames)
+        let channels = Int(tapFormat.mChannelsPerFrame)
+        let framesToRead = min(requestedFrames, scratchFrameCapacity)
 
-            if readFrames < requestedFrames {
-                memset(dest.advanced(by: readFrames * channelCount), 0,
-                       (requestedFrames - readFrames) * channelCount * MemoryLayout<Float>.size)
-            }
+        // 1. Single read from ring buffer into scratch (interleaved)
+        let readFrames = rb.read(into: scratch, frameCount: framesToRead)
 
-            if readFrames > 0 {
-                if channelCount == 1 {
-                    if bufferIndex == 0 { leftFilter?.processBuffer(dest, frameCount: readFrames) }
-                    else if bufferIndex == 1 { rightFilter?.processBuffer(dest, frameCount: readFrames) }
-                } else if channelCount >= 2, var left = leftFilter, var right = rightFilter {
-                    for frame in 0..<readFrames {
-                        let idx = frame * channelCount
-                        dest[idx] = left.process(dest[idx])
-                        dest[idx + 1] = right.process(dest[idx + 1])
-                    }
-                    leftFilter = left; rightFilter = right
+        // Zero any remaining frames in scratch
+        if readFrames < framesToRead {
+            let validSamples = readFrames * channels
+            let totalSamples = framesToRead * channels
+            memset(scratch.advanced(by: validSamples), 0,
+                   (totalSamples - validSamples) * MemoryLayout<Float>.size)
+        }
+
+        // 2. Apply EQ in-place on scratch buffer
+        if readFrames > 0, let eq = eqProcessor {
+            eq.processInterleaved(buffer: scratch, frameCount: readFrames, channels: channels)
+        }
+
+        // 3. Distribute to output buffers
+        if bufferList.count == 1, let data = bufferList[0].mData {
+            // Interleaved output — straight copy
+            memcpy(data, scratch, framesToRead * channels * MemoryLayout<Float>.size)
+        } else {
+            // Non-interleaved — deinterleave from scratch
+            for ch in 0..<min(bufferList.count, channels) {
+                guard let data = bufferList[ch].mData else { continue }
+                let dest = data.assumingMemoryBound(to: Float.self)
+                for frame in 0..<framesToRead {
+                    dest[frame] = scratch[frame * channels + ch]
                 }
             }
-            bufferIndex += 1
         }
+
         return noErr
     }
 
     private func startAudio() -> Bool {
-        OSAtomicCompareAndSwap32(ioProcSettleCount, ioProcSettleCallbacks, &ioProcSettleCount)
+        ioProcSettleCount = ioProcSettleCallbacks
         startReadingFromAggregate()
 
         guard let au = outputAU else { return false }
 
         let targetFrames = Int(tapFormat.mSampleRate * 0.01)
+
+        // First wait: let IOProc settle and tap stabilize
         let startTime = CFAbsoluteTimeGetCurrent()
         while (ringBuffer?.fillLevel ?? 0) < targetFrames {
             if (CFAbsoluteTimeGetCurrent() - startTime) * 1000 > 200 { break }
+            usleep(1000)
+        }
+
+        // Discard settle/warm-up frames — may contain un-muted audio
+        ringBuffer?.clear()
+
+        // Second wait: refill with clean post-settle audio
+        let refillStart = CFAbsoluteTimeGetCurrent()
+        while (ringBuffer?.fillLevel ?? 0) < targetFrames {
+            if (CFAbsoluteTimeGetCurrent() - refillStart) * 1000 > 200 { break }
             usleep(1000)
         }
 
@@ -439,6 +560,11 @@ final class AudioEngine {
         if let au = outputAU { AudioUnitUninitialize(au); AudioComponentInstanceDispose(au); outputAU = nil }
         cleanupAggregateDevice()
         ringBuffer = nil
+        if let ptr = scratchBuffer {
+            ptr.deinitialize(count: scratchBufferSampleCount)
+            ptr.deallocate()
+            scratchBuffer = nil
+        }
     }
 
     deinit {
