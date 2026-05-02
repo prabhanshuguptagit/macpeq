@@ -2,28 +2,29 @@ import CoreAudio
 import AudioToolbox
 import Foundation
 
-/// Creates and destroys Core Audio process taps on demand.
+/// Creates and destroys Core Audio process taps on demand. A tap captures
+/// audio from a specific output device's stream.
 @available(macOS 14.2, *)
 final class DeviceTapManager {
-    static weak var shared: DeviceTapManager?
 
     /// Create a tap for the given device. Returns the tapID, or nil on failure.
     func createTap(for deviceID: AudioDeviceID) -> AudioObjectID? {
         var uidCF: CFString = "" as CFString
-        guard withUnsafeMutablePointer(to: &uidCF, { ptr in
-            getProperty(of: deviceID, selector: kAudioDevicePropertyDeviceUID, value: &ptr.pointee)
-        }) == noErr else { return nil }
+        guard getProperty(of: deviceID, selector: kAudioDevicePropertyDeviceUID, value: &uidCF) == noErr else {
+            return nil
+        }
         let deviceUID = uidCF as String
 
         let ownPID = ProcessInfo.processInfo.processIdentifier
         guard let ownProcessObject = translatePIDToProcessObject(ownPID) else { return nil }
-
+        
         let tapDesc = CATapDescription(
             __processes: [NSNumber(value: ownProcessObject)],
             andDeviceUID: deviceUID,
             withStream: 0)
         tapDesc.isPrivate = true
         tapDesc.name = "MacPEQ"
+        // Exclude our own process from the tap.
         tapDesc.isExclusive = true
         tapDesc.muteBehavior = .muted
 
@@ -34,33 +35,13 @@ final class DeviceTapManager {
         return newTapID
     }
 
-    /// Destroy a tap by ID.
     func destroyTap(_ tapID: AudioObjectID) {
         AudioHardwareDestroyProcessTap(tapID)
     }
 
-    private func getProperty<T>(
-        of objectID: AudioObjectID, selector: AudioObjectPropertySelector, value: inout T
-    ) -> OSStatus {
-        var address = AudioObjectPropertyAddress(
-            mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
-        var size = UInt32(MemoryLayout<T>.size)
-        return AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &value)
-    }
-
-    private func getProperty<T, Q>(
-        of objectID: AudioObjectID, selector: AudioObjectPropertySelector,
-        qualifier: inout Q, value: inout T
-    ) -> OSStatus {
-        var address = AudioObjectPropertyAddress(
-            mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
-        var size = UInt32(MemoryLayout<T>.size)
-        return AudioObjectGetPropertyData(objectID, &address,
-            UInt32(MemoryLayout<Q>.size), &qualifier, &size, &value)
-    }
-
+    /// CoreAudio identifies processes by an opaque `AudioObjectID` rather than
+    /// a PID. Translate one to the other so we can reference our own process
+    /// in the tap description.
     private func translatePIDToProcessObject(_ pid: Int32) -> AudioObjectID? {
         var processObject: AudioObjectID = 0
         var mutablePid = pid

@@ -9,3 +9,4 @@ MacPEQ.app/
 /tmp/macpeq.log
 .clj-kondo/
 .lsp/
+.vscode/
