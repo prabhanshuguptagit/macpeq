@@ -1,0 +1,140 @@
+# MacPEQ Performance Investigation — From 33% to <1% CPU
+
+## Context
+
+MacPEQ is a system-wide parametric EQ for macOS. After commit `f1110f0` ("Fix concurrency for updates from GUI"), CPU usage jumped from 5% to 33%. This document records the investigation and the architectural decisions made along the way.
+
+## Timeline of findings
+
+### Bug 1: The 6× regression — bypassed bands weren't bypassed
+
+**Symptom:** 33% CPU with the default 2-band telephone preset.
+
+**Root cause:** `EQProcessor` was constructed with a hardcoded `bandCount: 10`, but `updateBands` only wrote coefficients for the bands the caller passed in. The remaining slots were left at the *identity coefficients* set in `init`:
+
+```swift
+let identity = BiquadCoefficients(b0: 1, b1: 0, b2: 0, a1: 0, a2: 0)
+```
+
+The render loop then ran every sample through all 10 sections unconditionally. Disabled bands were doing 5 multiplies + 4 adds + 4 state-shuffle stores per sample — work that produced no audible effect.
+
+For 2 active bands at stereo 48kHz, that meant 8 wasted biquads × 2 channels × 48000 samples/sec = ~768K wasted operations per second.
+
+**Why this was hard to spot:** identity coefficients *do* pass audio through unchanged, so the EQ sounded correct. The cost was invisible to the ear and hidden behind a constant `for band in 0..<bandCount` loop.
+
+**Lesson:** when bypassing work, bypass it explicitly. "Mathematical no-op" is not the same as "performance no-op."
+
+### Bug 2: The architecture itself was wrong for the job
+
+Even if we fixed Bug 1, a hand-rolled scalar Swift biquad loop was never going to compete with what Apple ships. The `f1110f0` rewrite had also introduced a thoughtful but overengineered concurrency model — a CAtomics-backed double-buffer for coefficient handoff between UI and audio threads — that solved a problem Accelerate already solves natively.
+
+**Decision: replace the entire EQ core with `vDSP_biquadm`.** Three reasons:
+
+1. **Performance.** Apple's NEON-vectorized cascade is 5–10× faster than scalar Swift on Direct Form I biquads. (Reports from third-party benchmarks; our profile later showed it processing in 2 samples out of 4014.)
+
+2. **Correctness primitives we wanted anyway.** vDSP ships:
+   - `vDSP_biquadm_SetActiveFilters` — *real* per-section bypass
+   - `vDSP_biquadm_SetTargetsSingle` — ramped coefficient updates that prevent zipper noise on slider drags (a latent bug in the old code: it snapped instantly to new coefficients)
+
+3. **Threading is solved by the API design.** vDSP's setup is mutated only from the audio thread; the UI thread posts targets that the audio thread applies at the top of each callback. We kept the CAtomics shim as a one-bit dirty flag rather than a buffer-index swap.
+
+### Bug 3: Stuck audio after MacPEQ exits
+
+**Symptom:** After quitting MacPEQ, system audio went silent. Device showed unmuted in System Settings. Switching outputs didn't fix it. `killall coreaudiod` did.
+
+**Root cause:** the signal handler in `main.swift` was `exit(0)` with no cleanup. This means:
+- Swift `deinit` doesn't run
+- `AudioEngine.stop()` doesn't run
+- The aggregate device created via `AudioHardwareCreateAggregateDevice` is leaked
+- That orphaned aggregate may remain the system default output, routing audio into a void
+
+The `destroyStaleAggregateDevice` recovery logic in `createAggregateDevice` handles this *on next launch* (deterministic UID lookup), but does nothing for the gap between "MacPEQ crashed/Ctrl-C'd" and "MacPEQ runs again."
+
+**Fix:** signal handler should call `engine.stop()` before `exit(0)`. Belt-and-suspenders: register an `atexit` handler that does the same — `atexit` *does* run on `exit()` even when `deinit` doesn't.
+
+**Lesson:** any code that creates persistent system resources (CoreAudio aggregates, taps, file locks, IPC channels) needs a cleanup path that runs on every exit, including signal-driven ones. `exit()` alone isn't a cleanup path.
+
+### Bug 4: The hidden 12% — Swift's range iterator was allocating
+
+After fixing Bugs 1 and 2, CPU dropped to 12%. Still high for an always-on utility. A `sample MacPEQ 5` profile gave the answer instantly:
+
+```
+EQProcessor.processInterleaved + 1648  EQProcessor.swift:245   270 samples
+EQProcessor.processInterleaved + 844   EQProcessor.swift:220   254 samples
+vDSP_biquadm                           libvDSP.dylib            2 samples
+```
+
+The vDSP cascade was free. The cost was entirely in the deinterleave/re-interleave loops I'd written:
+
+```swift
+for f in 0..<frameCount {
+    dst[f] = buffer[f * channels + ch]
+}
+```
+
+Looking under those stacks, the leaf functions were `IndexingIterator.next`, `Range<>.subscript.read`, `_swift_getGenericMetadata`, `swift_getTupleTypeMetadata`, **and `nanov2_malloc_type` / `_nanov2_free`**. Some interaction in this build prevented `Range<Int>`'s iterator from specializing, so each frame index iteration was doing a metadata lookup and a heap allocation. At 48kHz that's tens of thousands of mallocs per second on the audio thread — exactly what RT code must never do.
+
+**Fix:** replace the inner loops with `cblas_scopy(n, src, srcStride, dst, dstStride)`. BLAS's strided vector copy is vectorized C, allocation-free, designed for exactly this case. Result: <1% CPU.
+
+**Lesson:** never write tight inner loops in Swift on the audio thread without profiling. Even "obviously simple" `for f in 0..<n` constructs can hide allocations and protocol dispatch when specialization fails. Reach for Accelerate primitives by default — they do the same thing without the runtime overhead.
+
+## Decision record
+
+### ADR-1: Use vDSP_biquadm for EQ processing
+- **Status:** Accepted
+- **Context:** A hand-rolled scalar biquad in Swift was responsible for ~30% CPU.
+- **Decision:** Replace the per-sample Swift loop with `vDSP_biquadm`, a single SIMD-accelerated cascade that processes all channels and all sections per call.
+- **Consequences:**
+  - Coefficients must be `Double` for `CreateSetup`, `Float` for `SetTargetsSingle`. We compute as `Float` and cast.
+  - vDSP_biquadm is non-interleaved (`float**`), so we must deinterleave around the call.
+  - Setup must be mutated from a single thread; we mutate only on the audio thread.
+
+### ADR-2: SetTargets ramping over double-buffered swaps
+- **Status:** Accepted
+- **Context:** The `f1110f0` rewrite double-buffered coefficient arrays with an atomic index swap. This was correct but overengineered; it also snapped instantly between coefficient sets, producing zipper noise on slider drags.
+- **Decision:** Use `vDSP_biquadm_SetTargetsSingle` for ramped coefficient changes. UI thread writes pending coefficients + sets a one-bit dirty flag. Audio thread checks the flag at the top of each callback and pushes targets in via `SetTargetsSingle`. vDSP interpolates toward them sample-by-sample.
+- **Consequences:**
+  - Threading discipline preserved: setup is touched from audio thread only.
+  - Zipper noise on parameter changes is eliminated.
+  - One CAtomic int32 replaces a double buffer of coefficient arrays.
+
+### ADR-3: Use SetActiveFilters for per-band bypass
+- **Status:** Accepted
+- **Context:** The old "identity coefficients = bypass" approach paid full cost for disabled bands.
+- **Decision:** Maintain a per-band bool array and call `vDSP_biquadm_SetActiveFilters` whenever the active mask changes. Keep coefficients at identity for disabled bands too, so re-enabling ramps from a transparent state.
+- **Consequences:** Disabled bands genuinely cost zero. CPU now scales with number of *enabled* bands.
+
+### ADR-4: cblas_scopy for deinterleaving
+- **Status:** Accepted
+- **Context:** Profile showed Swift's `for f in 0..<frameCount` loop allocating per iteration on the audio thread.
+- **Decision:** Replace per-sample Swift loops with `cblas_scopy(n, src, srcStride, dst, dstStride)`.
+- **Consequences:** Allocation-free, vectorized. Establishes a precedent: any tight loop on the audio thread should be an Accelerate or BLAS call, not Swift.
+
+### ADR-5: Signal handler must clean up CoreAudio resources
+- **Status:** Accepted (still to be implemented in your tree based on the conversation)
+- **Context:** `exit(0)` doesn't run Swift `deinit`. Aggregate devices and taps leak on Ctrl-C, leaving system audio routing in a broken state.
+- **Decision:** Signal handler calls `engine.stop()` explicitly. Optionally also register an `atexit` handler as a safety net.
+- **Consequences:** Clean shutdown actually shuts down. Crashes still leak (unavoidable), but `destroyStaleAggregateDevice` catches those on next launch.
+
+## Performance summary
+
+| State | CPU | Notes |
+|---|---|---|
+| Before commit `f1110f0` | ~5% | 2 hardcoded biquads |
+| After `f1110f0` | 33% | 10 bands always running, 2 useful |
+| After vDSP_biquadm | 12% | Real cascade, but Swift loops around it |
+| After cblas_scopy | <1% | Allocation-free deinterleave |
+
+## General lessons for real-time audio in Swift
+
+1. **Profile, don't guess.** I gave you four wrong theories about the 12% before `sample` showed it was Swift's range iterator. A 5-second profile beats an hour of speculation.
+
+2. **The audio thread cannot allocate.** Not "shouldn't" — *cannot*, in any production-quality sense. malloc can block, holds locks, has unbounded latency. If a profile shows `nanov2_malloc_type` under your render callback, that's a bug regardless of how small the percentage looks.
+
+3. **Reach for Accelerate by default.** vDSP, BLAS, and the rest of Accelerate are vectorized, allocation-free, and designed exactly for audio/DSP shapes. If you find yourself writing a tight loop over floats, there's almost certainly a function for it.
+
+4. **"Mathematical no-op" is not "performance no-op."** Identity coefficients don't change the audio but they do execute. Bypass explicitly.
+
+5. **Cleanup on every exit path, not just the happy one.** Signals, crashes, and `exit()` calls don't run `deinit`. Use `atexit` or signal handlers that call into your cleanup.
+
+6. **Concurrency primitives should match the API you're calling.** vDSP has built-in ramped-update support (`SetTargets`); rolling your own double-buffer was reinventing a wheel that came with the framework.
