@@ -9,10 +9,15 @@ func signalHandler(signal: Int32) {
     exit(0)
 }
 
-// Telephone effect: high-pass at 300Hz + low-pass at 3400Hz
+// bx5 eq settings from Peace/EqualizerAPO
 let defaultBands: [EQBand] = [
-    EQBand(frequency: 300,  gain: 0, q: 0.7, type: .highPass),
-    EQBand(frequency: 3400, gain: 0, q: 0.7, type: .lowPass),
+    EQBand(frequency: 30,  gain: -1.4, q: 5.0,   type: .peak),
+    EQBand(frequency: 60,  gain: -3.0,   q: 2,   type: .peak),
+    EQBand(frequency: 63,  gain: -5.0,   q: 5.0,   type: .peak),
+    EQBand(frequency: 118, gain: -8.0,   q: 12.0, type: .peak),
+    EQBand(frequency: 175, gain: -4.0,   q: 14.0, type: .peak),
+    EQBand(frequency: 244, gain: -3.0,   q: 10.0, type: .peak),
+    EQBand(frequency: 333, gain: -0.2,   q: 1.4,  type: .peak),
 ]
 
 guard #available(macOS 14.2, *) else {
