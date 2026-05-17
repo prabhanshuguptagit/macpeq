@@ -1,4 +1,5 @@
 import Foundation
+import MacPEQLib
 
 // MacPEQ — System-Wide Parametric EQ
 // Usage: swift run MacPEQ (or open MacPEQ.app)

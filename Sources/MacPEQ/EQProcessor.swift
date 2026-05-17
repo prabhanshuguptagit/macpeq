@@ -1,6 +1,7 @@
 import Foundation
 import Accelerate
 import CAtomics
+import MacPEQLib
 
 /// Thread-safe parametric EQ processor backed by vDSP's multichannel biquad cascade.
 ///

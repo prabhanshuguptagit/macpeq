@@ -1,6 +1,7 @@
 import CoreAudio
 import AudioToolbox
 import Foundation
+import MacPEQLib
 
 @available(macOS 14.2, *)
 fileprivate func ioProcCallback(
