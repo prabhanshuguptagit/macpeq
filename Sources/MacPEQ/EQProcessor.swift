@@ -209,6 +209,11 @@ final class EQProcessor {
     func processInterleaved(buffer: UnsafeMutablePointer<Float>,
                             frameCount: Int,
                             channels: Int) {
+        // Enable flush-to-zero to prevent 100x CPU penalty when filter states
+        // decay to subnormal values during quiet passages. FPCR/MXCSR are
+        // thread-local, so this configures whichever thread CoreAudio uses.
+        catomics_enable_denormal_suppression()
+
         guard frameCount > 0, frameCount <= channelScratchCapacity else { return }
         applyPendingIfNeeded()
 
