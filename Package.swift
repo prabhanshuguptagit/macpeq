@@ -21,7 +21,8 @@ let package = Package(
             name: "MacPEQ",
             dependencies: ["TPCircularBuffer", "CAtomics", "MacPEQLib"],
             swiftSettings: [
-                .unsafeFlags(["-suppress-warnings"])
+                .unsafeFlags(["-suppress-warnings"]),
+                .define("RELEASE", .when(configuration: .release))
             ],
             linkerSettings: [
                 .linkedFramework("CoreAudio"),

@@ -4,13 +4,21 @@ set -e
 APP="MacPEQ"
 BUNDLE_ID="com.macpeq.MacPEQ"
 
-echo "Building $APP..."
-swift build
+# Parse arguments
+CONFIG="debug"
+BUILD_DIR="debug"
+if [[ "$1" == "--release" || "$1" == "-r" ]]; then
+    CONFIG="release"
+    BUILD_DIR="release"
+fi
+
+echo "Building $APP ($CONFIG)..."
+swift build -c $CONFIG
 
 echo "Creating app bundle..."
 rm -rf "$APP.app"
 mkdir -p "$APP.app/Contents/MacOS"
-cp ".build/debug/$APP" "$APP.app/Contents/MacOS/"
+cp ".build/$BUILD_DIR/$APP" "$APP.app/Contents/MacOS/"
 
 cat > "$APP.app/Contents/Info.plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -40,6 +48,9 @@ echo "Resetting permission..."
 tccutil reset ScreenCapture "$BUNDLE_ID" 2>/dev/null || tccutil reset ScreenCapture
 
 echo ""
-echo "Built $APP.app"
+echo "Built $APP.app ($CONFIG)"
+if [[ "$CONFIG" == "debug" ]]; then
+    echo "For production build: ./build.sh --release"
+fi
 echo "Run: open $APP.app"
 echo "Then grant permission in System Settings -> Privacy & Security -> Screen & System Audio Recording"

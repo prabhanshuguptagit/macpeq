@@ -24,7 +24,8 @@ enum Logger {
             // Write to stderr
             FileHandle.standardError.write(data)
             
-            // Also append to file
+            // Only write to file in debug builds
+            #if !RELEASE
             if FileManager.default.fileExists(atPath: logFilePath) {
                 if let fh = FileHandle(forWritingAtPath: logFilePath) {
                     _ = try? fh.seekToEnd()
@@ -34,6 +35,7 @@ enum Logger {
             } else {
                 try? data.write(to: URL(fileURLWithPath: logFilePath))
             }
+            #endif
         }
     }
     
